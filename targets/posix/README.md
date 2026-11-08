@@ -1,6 +1,7 @@
 ﻿# .NET nanoFramework nanoCLR - POSIX Host Target
 
-This target provides a host build of nanoCLR for macOS and Linux at `targets/posix`.
+This target provides a host build of nanoCLR for macOS and Linux at `targets/posix`. It can also be
+cross-compiled for QNX 8.0 (x86_64, aarch64) without networking.
 
 ## Status
 
@@ -34,6 +35,20 @@ cmake --build build/posix
 cmake -S targets/posix -B build/posix -G Ninja
 cmake --build build/posix
 ```
+
+### QNX 8.0 (cross-compile)
+
+Requires the QNX SDP 8.0 environment (`QNX_HOST`, `QNX_TARGET`, e.g. from `qnxsdp-env.bat` /
+`qnxsdp-env.sh`), CMake 3.24+ and Ninja. Use `toolchain-aarch64-qnx.cmake` for aarch64.
+
+```bash
+cmake -S targets/posix -B build/posix-qnx-x86_64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=toolchain-x86_64-qnx.cmake
+cmake --build build/posix-qnx-x86_64
+```
+
+Networking is not available on QNX (`NANO_POSIX_ENABLE_NETWORKING` is `OFF`). On the target the
+runner needs `libc++.so.2` from the QNX image. The QNX runtime linker does not expand `$ORIGIN`, so
+the runner carries no RPATH: point `LD_LIBRARY_PATH` at the deployed `lib/` directory.
 
 Both macOS and Linux networking statically link the repository-pinned mbedTLS
 (currently 3.6.7); no OpenSSL or system mbedTLS development/runtime packages are
@@ -69,6 +84,12 @@ IPv4 addresses exposed by the managed snapshot.
 `NANO_POSIX_ENABLE_SMOKE`
 - Default: `ON`
 - Builds the standalone command-line application runner, including its startup banner/version output.
+
+`NANO_POSIX_ENABLE_NETWORKING`
+- Default: `ON` on macOS and Linux, `OFF` elsewhere (e.g. QNX)
+- Builds the host-OS sockets, DNS and TLS backend and registers `System.Net`. When `OFF`, mbedTLS is
+  not fetched and the runner rejects `--ca-bundle`. Turning it on outside macOS and Linux is a
+  configure error.
 
 ## POSIX Networking (macOS and Linux, including WSL)
 

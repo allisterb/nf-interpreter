@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.24)
 project(nanoFramework_nanoCLR_posix VERSION 0.1.0 LANGUAGES C CXX)
 
 if(NOT UNIX)
-    message(FATAL_ERROR "targets/posix can only be built on POSIX platforms (macOS or Linux).")
+    message(FATAL_ERROR "targets/posix can only be built on POSIX platforms (macOS, Linux or QNX).")
 endif()
 
 # Architecture selection is only meaningful on macOS (Apple Silicon vs Intel).
@@ -37,6 +37,19 @@ if(APPLE)
 endif()
 
 option(NANO_POSIX_ENABLE_SMOKE "Build smoke behavior (banner/version output)." ON)
+
+# Host-OS sockets, DNS and TLS are implemented for Linux and macOS only; other POSIX hosts (e.g. QNX)
+# build without them by default.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE)
+    set(_nano_posix_networking_default ON)
+else()
+    set(_nano_posix_networking_default OFF)
+endif()
+option(NANO_POSIX_ENABLE_NETWORKING "Build host-OS sockets, DNS and TLS (System.Net)." ${_nano_posix_networking_default})
+
+if(NANO_POSIX_ENABLE_NETWORKING AND NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
+    message(FATAL_ERROR "NANO_POSIX_ENABLE_NETWORKING is only supported on Linux and macOS.")
+endif()
 
 # Note: the standard embedded-target layout (nanoBooter/ + nanoCLR/ + common/) applies to
 # board targets (ChibiOS, ThreadX, ESP32, etc.).  Host/virtual targets (targets/win32,
