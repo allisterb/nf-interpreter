@@ -51,6 +51,8 @@ if(NANO_POSIX_ENABLE_NETWORKING AND NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR A
     message(FATAL_ERROR "NANO_POSIX_ENABLE_NETWORKING is only supported on Linux and macOS.")
 endif()
 
+option(NANO_POSIX_GC_TIMING "Print a [GCT] timing line for every GC and heap compaction (measurement builds)." OFF)
+
 # Note: the standard embedded-target layout (nanoBooter/ + nanoCLR/ + common/) applies to
 # board targets (ChibiOS, ThreadX, ESP32, etc.).  Host/virtual targets (targets/win32,
 # targets/posix) intentionally omit nanoBooter/ and common/ — there is no bootloader

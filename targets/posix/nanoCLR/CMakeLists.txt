@@ -343,6 +343,11 @@ target_compile_definitions(
     NANO_POSIX_ENABLE_SMOKE=$<BOOL:${NANO_POSIX_ENABLE_SMOKE}>
 )
 
+if(NANO_POSIX_GC_TIMING)
+    target_sources(nanoFramework.nanoCLR PRIVATE GcTiming.cpp)
+    target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_GC_TIMING)
+endif()
+
 # Hide all symbols by default; only NANOCLRNATIVE_API-marked symbols are exported.
 target_compile_options(nanoFramework.nanoCLR PRIVATE -fvisibility=hidden)
 

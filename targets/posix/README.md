@@ -91,6 +91,29 @@ IPv4 addresses exposed by the managed snapshot.
   not fetched and the runner rejects `--ca-bundle`. Turning it on outside macOS and Linux is a
   configure error.
 
+`NANO_POSIX_GC_TIMING`
+- Default: `OFF`
+- For measurement builds. Prints one line per garbage collection and per heap compaction to the
+  debug output (stdout, or the callback set with `nanoCLR_SetDebugPrintCallback`), in order with
+  `Debug.WriteLine` output. Durations are in nanoseconds, timed with `ClockCycles()` on QNX and
+  `CLOCK_MONOTONIC` elsewhere:
+
+  ```text
+  [GCT] clock=ClockCycles ticks_per_sec=2495974759
+  [GCT] gc run=12 total_ns=... prepare_ns=... mark_ns=... markweak_ns=... sweep_ns=... ratio_ns=... pressure_ns=... markslow_passes=0 used_bytes=... heap_bytes=...
+  [GCT] compact run=3 total_ns=... used_bytes=... heap_bytes=...
+  ```
+
+  - `run` is the collector's own counter. The native `System.GC.Run(true)`
+    (`Run___STATIC__U4__BOOLEAN`) decrements it after collecting, so numbers can repeat.
+  - `markslow_passes` counts full-heap rescans after the mark stack ran out of space.
+  - `heap_bytes` is the sum of the heap clusters' payloads, a little less than the heap size.
+  - On a `compact` line, `used_bytes` and `heap_bytes` are as of the last collection, which may be
+    well before the compaction.
+  - On QNX x86_64, `ClockCycles()` reads the TSC. If the CPUs' TSCs are not synchronised (possible
+    under some hypervisors), a thread that moves between CPUs can record a wrapped, huge duration.
+    Pin the process to one CPU if that happens.
+
 ## POSIX Networking (macOS and Linux, including WSL)
 
 The socket scheduler, resolver, managed networking bridge and mbedTLS
@@ -486,6 +509,10 @@ these may include `System.Net`, `System.Net.Http`, `System.IO.Streams`,
 `nanoFramework.System.Text`, `nanoFramework.System.Collections` and
 `System.Threading`, plus their dependencies. All PEs must match this runtime's
 native contracts and assembly format.
+
+The managed heap is 10 MiB. Set `NANOCLR_HEAP_SIZE` to a size in decimal bytes (1 MiB to 1 GiB) to
+change it; an invalid value prints a warning and keeps the default. The heap never grows, and it is
+filled when allocated, so all of it is committed at startup.
 
 ## POSIX Shim Headers
 

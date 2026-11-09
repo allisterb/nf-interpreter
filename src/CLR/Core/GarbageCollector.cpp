@@ -5,6 +5,15 @@
 //
 #include "Core.h"
 
+#if defined(NANOCLR_GC_TIMING)
+#include <nanoCLR_GcTiming.h>
+
+static CLR_UINT32 s_gcTimingMarkSlowPasses;
+#define NANOCLR_GC_TIMING_STAMP(stamps, i) ((stamps)[i] = GcTiming_Now())
+#else
+#define NANOCLR_GC_TIMING_STAMP(stamps, i) ((void)0)
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 CLR_RT_ProtectFromGC *CLR_RT_ProtectFromGC::s_first = nullptr;
@@ -173,6 +182,12 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteGarbageCollection()
     g_CLR_PRF_Profiler.RecordGarbageCollectionBegin();
 #endif
 
+#if defined(NANOCLR_GC_TIMING)
+    uint64_t gcTiming[c_GcTiming_Count];
+    s_gcTimingMarkSlowPasses = 0;
+#endif
+    NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Start);
+
 #if defined(NANOCLR_TRACE_MEMORY_STATS) || defined(NANOCLR_GC_VERBOSE)
 
     CLR_UINT64 stats_start = HAL_Time_CurrentSysTicks();
@@ -195,14 +210,29 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteGarbageCollection()
     CLR_RT_ExecutionEngine::ExecutionConstraint_Suspend();
 
     g_CLR_RT_EventCache.EventCache_Cleanup();
+    NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Prepare);
 
     Mark();
+    NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Mark);
     MarkWeak();
+    NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_MarkWeak);
     Sweep();
+    NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Sweep);
 
     Heap_ComputeAliveVsDeadRatio();
+    NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Ratio);
 
     CheckMemoryPressure();
+    NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Pressure);
+
+#if defined(NANOCLR_GC_TIMING)
+    GcTiming_ReportCollection(
+        m_numberOfGarbageCollections,
+        gcTiming,
+        s_gcTimingMarkSlowPasses,
+        m_totalBytes - m_freeBytes,
+        m_totalBytes);
+#endif
 
 #if defined(NANOCLR_TRACE_MEMORY_STATS)
     if (s_CLR_RT_fTrace_MemoryStats >= c_CLR_RT_Trace_Info)
@@ -330,6 +360,10 @@ void CLR_RT_GarbageCollector::MarkSlow()
     while (m_fOutOfStackSpaceForGC)
     {
         m_fOutOfStackSpaceForGC = false;
+
+#if defined(NANOCLR_GC_TIMING)
+        s_gcTimingMarkSlowPasses++;
+#endif
 
         // go through managed heap.
         // find all objects that are not alive but are pointed to by a live object

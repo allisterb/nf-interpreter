@@ -5,6 +5,10 @@
 //
 #include "Core.h"
 
+#if defined(NANOCLR_GC_TIMING)
+#include <nanoCLR_GcTiming.h>
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 CLR_UINT32 CLR_RT_GarbageCollector::ExecuteCompaction()
@@ -34,11 +38,24 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteCompaction()
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if defined(NANOCLR_GC_TIMING)
+    uint64_t gcTimingStart = GcTiming_Now();
+#endif
+
     CLR_RT_ExecutionEngine::ExecutionConstraint_Suspend();
 
     Heap_Compact();
 
     CLR_RT_ExecutionEngine::ExecutionConstraint_Resume();
+
+#if defined(NANOCLR_GC_TIMING)
+    GcTiming_ReportCompaction(
+        m_numberOfCompactions,
+        gcTimingStart,
+        GcTiming_Now(),
+        m_totalBytes - m_freeBytes,
+        m_totalBytes);
+#endif
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
 #if defined(NANOCLR_PROFILE_NEW_ALLOCATIONS)
