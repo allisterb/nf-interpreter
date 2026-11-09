@@ -3151,6 +3151,10 @@ struct CLR_RT_GarbageCollector
     //--//
 
     static const int c_minimumSpaceForGC = 128;
+#if defined(NANOCLR_GC_HOST_MARK_STACK)
+    // Entries per mark-stack overflow chunk taken from platform_malloc.
+    static const int c_hostMarkStackChunkEntries = 16384;
+#endif
     static const int c_minimumSpaceForCompact = 128;
     static const CLR_UINT32 c_pressureThreshold = 10;
 
@@ -3174,6 +3178,9 @@ struct CLR_RT_GarbageCollector
 
     CLR_RT_DblLinkedList *m_markStackList;
     MarkStack *m_markStack;
+    // Bytes of overflow mark stack held from platform_malloc during the current mark (NANOCLR_GC_HOST_MARK_STACK).
+    // Unconditional so the struct layout does not depend on a target-private define.
+    size_t m_hostMarkStackBytes;
 
     RelocationRegion *m_relocBlocks;
     size_t m_relocTotal;

@@ -52,6 +52,7 @@ if(NANO_POSIX_ENABLE_NETWORKING AND NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR A
 endif()
 
 option(NANO_POSIX_GC_TIMING "Print a [GCT] timing line for every GC and heap compaction (measurement builds)." OFF)
+option(NANO_POSIX_GC_HOST_MARK_STACK "Take GC mark-stack overflow chunks from host memory instead of the managed heap." ON)
 
 # Note: the standard embedded-target layout (nanoBooter/ + nanoCLR/ + common/) applies to
 # board targets (ChibiOS, ThreadX, ESP32, etc.).  Host/virtual targets (targets/win32,

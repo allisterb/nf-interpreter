@@ -9,6 +9,7 @@
 #include <nanoCLR_GcTiming.h>
 
 static CLR_UINT32 s_gcTimingMarkSlowPasses;
+GcTimingMarkStack g_GcTimingMarkStack;
 #define NANOCLR_GC_TIMING_STAMP(stamps, i) ((stamps)[i] = GcTiming_Now())
 #else
 #define NANOCLR_GC_TIMING_STAMP(stamps, i) ((void)0)
@@ -185,6 +186,7 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteGarbageCollection()
 #if defined(NANOCLR_GC_TIMING)
     uint64_t gcTiming[c_GcTiming_Count];
     s_gcTimingMarkSlowPasses = 0;
+    g_GcTimingMarkStack = {};
 #endif
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Start);
 
@@ -230,6 +232,7 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteGarbageCollection()
         m_numberOfGarbageCollections,
         gcTiming,
         s_gcTimingMarkSlowPasses,
+        g_GcTimingMarkStack,
         m_totalBytes - m_freeBytes,
         m_totalBytes);
 #endif
@@ -401,6 +404,9 @@ void CLR_RT_GarbageCollector::Mark()
     m_funcMultipleBlocks = ComputeReachabilityGraphForMultipleBlocks;
 
     m_fOutOfStackSpaceForGC = false;
+#if defined(NANOCLR_GC_HOST_MARK_STACK)
+    m_hostMarkStackBytes = 0;
+#endif
 
     ////////////////////////////////////////////////////////////////////////////
     //
@@ -533,7 +539,11 @@ void CLR_RT_GarbageCollector::Mark()
 
         markStackT->RemoveFromList();
 
+#if defined(NANOCLR_GC_HOST_MARK_STACK)
+        platform_free(markStackT);
+#else
         CLR_RT_Memory::Release(markStackT);
+#endif
     }
 
     m_markStackList = nullptr;

@@ -96,18 +96,20 @@ void GcTiming_ReportCollection(
     uint32_t run,
     const uint64_t (&stamps)[c_GcTiming_Count],
     uint32_t markSlowPasses,
+    const GcTimingMarkStack &markStack,
     uint32_t usedBytes,
     uint32_t heapBytes)
 {
     auto span = [&](int i) { return ToNs(stamps[i] - stamps[i - 1]); };
 
-    char line[320];
+    char line[448];
     int n = std::snprintf(
         line,
         sizeof(line),
         "[GCT] gc run=%" PRIu32 " total_ns=%" PRIu64 " prepare_ns=%" PRIu64 " mark_ns=%" PRIu64 " markweak_ns=%" PRIu64
         " sweep_ns=%" PRIu64 " ratio_ns=%" PRIu64 " pressure_ns=%" PRIu64 " markslow_passes=%" PRIu32
-        " used_bytes=%" PRIu32 " heap_bytes=%" PRIu32 "\r\n",
+        " markstack_chunks=%" PRIu32 " markstack_entries=%" PRIu32 " markstack_failed=%" PRIu32
+        " markstack_alloc_ns=%" PRIu64 " used_bytes=%" PRIu32 " heap_bytes=%" PRIu32 "\r\n",
         run,
         ToNs(stamps[c_GcTiming_Count - 1] - stamps[c_GcTiming_Start]),
         span(c_GcTiming_Prepare),
@@ -117,6 +119,10 @@ void GcTiming_ReportCollection(
         span(c_GcTiming_Ratio),
         span(c_GcTiming_Pressure),
         markSlowPasses,
+        markStack.chunks,
+        markStack.entries,
+        markStack.failedAttempts,
+        ToNs(markStack.allocTicks),
         usedBytes,
         heapBytes);
 

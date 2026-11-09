@@ -348,6 +348,10 @@ if(NANO_POSIX_GC_TIMING)
     target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_GC_TIMING)
 endif()
 
+if(NANO_POSIX_GC_HOST_MARK_STACK)
+    target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_GC_HOST_MARK_STACK)
+endif()
+
 # Hide all symbols by default; only NANOCLRNATIVE_API-marked symbols are exported.
 target_compile_options(nanoFramework.nanoCLR PRIVATE -fvisibility=hidden)
 

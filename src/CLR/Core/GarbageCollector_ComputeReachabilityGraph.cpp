@@ -6,6 +6,10 @@
 
 #include "Core.h"
 
+#if defined(NANOCLR_GC_TIMING)
+#include <nanoCLR_GcTiming.h>
+#endif
+
 //--//
 
 void CLR_RT_GarbageCollector::MarkStack::Initialize(MarkStackElement *ptr, size_t num)
@@ -118,6 +122,47 @@ bool CLR_RT_GarbageCollector::ComputeReachabilityGraphForMultipleBlocks(CLR_RT_H
                         // If there was no space for GC last time, don't bother trying to allocate again
                         if (!g_CLR_RT_GarbageCollector.m_fOutOfStackSpaceForGC)
                         {
+#if defined(NANOCLR_GC_TIMING)
+                            uint64_t gcTimingAllocStart = GcTiming_Now();
+#endif
+#if defined(NANOCLR_GC_HOST_MARK_STACK)
+                            // Host memory instead of the managed heap, which is usually full when a GC runs: carving
+                            // small chunks out of it dominated mark time. Capped at the managed heap's size.
+                            const size_t cElement = g_CLR_RT_GarbageCollector.c_hostMarkStackChunkEntries;
+                            const size_t size = sizeof(MarkStack) + sizeof(MarkStackElement) * cElement;
+
+                            if (g_CLR_RT_GarbageCollector.m_hostMarkStackBytes + size <= s_CLR_RT_Heap.size)
+                            {
+                                stackNext = (MarkStack *)platform_malloc(size);
+                            }
+
+                            // Rebase note: the linking below mirrors the managed-heap branch; change both together.
+                            if (stackNext)
+                            {
+                                g_CLR_RT_GarbageCollector.m_hostMarkStackBytes += size;
+
+                                COMPUTEREACHABILITY_SAVESTATE();
+
+                                stackNext->Initialize((MarkStackElement *)(&stackNext[1]), cElement);
+
+                                g_CLR_RT_GarbageCollector.m_markStackList->LinkAtBack(stackNext);
+
+                                g_CLR_RT_GarbageCollector.m_markStack = stackNext;
+
+                                COMPUTEREACHABILITY_LOADSTATE();
+
+#if defined(NANOCLR_GC_TIMING)
+                                g_GcTimingMarkStack.chunks++;
+                                g_GcTimingMarkStack.entries += (uint32_t)cElement;
+#endif
+                            }
+#if defined(NANOCLR_GC_TIMING)
+                            else
+                            {
+                                g_GcTimingMarkStack.failedAttempts++;
+                            }
+#endif
+#else
                             // Try to allocate next stack for HeapBlock temporary storing.
                             // Allocate at least 2 elements. The first one will be used as a sentinel. HeapBlocks
                             // will be stored starting from the second element.
@@ -142,9 +187,21 @@ bool CLR_RT_GarbageCollector::ComputeReachabilityGraphForMultipleBlocks(CLR_RT_H
 
                                     COMPUTEREACHABILITY_LOADSTATE();
 
+#if defined(NANOCLR_GC_TIMING)
+                                    g_GcTimingMarkStack.chunks++;
+                                    g_GcTimingMarkStack.entries += (uint32_t)cElement;
+#endif
                                     break;
                                 }
+
+#if defined(NANOCLR_GC_TIMING)
+                                g_GcTimingMarkStack.failedAttempts++;
+#endif
                             }
+#endif // NANOCLR_GC_HOST_MARK_STACK
+#if defined(NANOCLR_GC_TIMING)
+                            g_GcTimingMarkStack.allocTicks += GcTiming_Now() - gcTimingAllocStart;
+#endif
                         }
 
                         if (stackNext == nullptr)

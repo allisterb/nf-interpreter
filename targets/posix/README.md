@@ -100,19 +100,35 @@ IPv4 addresses exposed by the managed snapshot.
 
   ```text
   [GCT] clock=ClockCycles ticks_per_sec=2495974759
-  [GCT] gc run=12 total_ns=... prepare_ns=... mark_ns=... markweak_ns=... sweep_ns=... ratio_ns=... pressure_ns=... markslow_passes=0 used_bytes=... heap_bytes=...
+  [GCT] gc run=12 total_ns=... prepare_ns=... mark_ns=... markweak_ns=... sweep_ns=... ratio_ns=... pressure_ns=... markslow_passes=0 markstack_chunks=1 markstack_entries=16384 markstack_failed=0 markstack_alloc_ns=... used_bytes=... heap_bytes=...
   [GCT] compact run=3 total_ns=... used_bytes=... heap_bytes=...
   ```
 
   - `run` is the collector's own counter. The native `System.GC.Run(true)`
     (`Run___STATIC__U4__BOOLEAN`) decrements it after collecting, so numbers can repeat.
   - `markslow_passes` counts full-heap rescans after the mark stack ran out of space.
+  - `markstack_*` describe the overflow chunks beyond the 128 mark-stack entries on the C stack:
+    chunks allocated, their entries (sentinels included), allocation attempts that failed or were
+    refused by the host cap, and the time spent allocating.
   - `heap_bytes` is the sum of the heap clusters' payloads, a little less than the heap size.
   - On a `compact` line, `used_bytes` and `heap_bytes` are as of the last collection, which may be
     well before the compaction.
   - On QNX x86_64, `ClockCycles()` reads the TSC. If the CPUs' TSCs are not synchronised (possible
     under some hypervisors), a thread that moves between CPUs can record a wrapped, huge duration.
     Pin the process to one CPU if that happens.
+
+`NANO_POSIX_GC_HOST_MARK_STACK`
+- Default: `ON`
+- When marking outgrows its 128-entry stack, take further stack chunks of 16384 entries (about
+  256 KiB on 64-bit, 128 KiB on 32-bit) from `platform_malloc` instead of from the managed heap.
+  Chunks are freed when the mark ends. Host memory held during one mark is capped at the managed
+  heap's size; past that, marking falls back to full-heap rescans as before.
+- Why: collections usually run because the managed heap is full. Carving mark-stack chunks out of
+  it then degrades to many tiny allocations, or fails into repeated full-heap rescans. With deep
+  object graphs (linked lists, trees) that took GC pauses from milliseconds to seconds. On QNX
+  8.0 x86_64, allocation-triggered collections with a 6 MiB linked list live went from 0.65 s
+  (10 MiB heap) and 2.25 s (40 MiB heap) to 5–9 ms (medians).
+- `OFF` restores the upstream behaviour.
 
 ## POSIX Networking (macOS and Linux, including WSL)
 

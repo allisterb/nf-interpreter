@@ -28,6 +28,17 @@ enum GcTimingStamp
     c_GcTiming_Count
 };
 
+// Mark-stack overflow chunks allocated during one collection (the first 128 entries are on the C stack).
+struct GcTimingMarkStack
+{
+    uint32_t chunks;         // chunks allocated
+    uint32_t entries;        // entries in those chunks, sentinel included
+    uint32_t failedAttempts; // allocation attempts that failed or were refused by the host cap
+    uint64_t allocTicks;     // time spent allocating chunks, in target ticks
+};
+
+extern GcTimingMarkStack g_GcTimingMarkStack;
+
 // Monotonic timestamp in target ticks.
 uint64_t GcTiming_Now();
 
@@ -36,6 +47,7 @@ void GcTiming_ReportCollection(
     uint32_t run,
     const uint64_t (&stamps)[c_GcTiming_Count],
     uint32_t markSlowPasses,
+    const GcTimingMarkStack &markStack,
     uint32_t usedBytes,
     uint32_t heapBytes);
 
