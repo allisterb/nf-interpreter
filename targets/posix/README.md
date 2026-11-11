@@ -153,6 +153,35 @@ IPv4 addresses exposed by the managed snapshot.
   by slot, and the tail left when `SetReflection` shrinks a two-block MethodInfo); they are expected.
   The check walks the whole heap at the start of every collection, so do not combine stress mode
   with `NANO_POSIX_GC_TIMING` measurements.
+- `NANOCLR_GC_VERIFY=1` turns on verify mode, which checks each mark against a second
+  stop-the-world mark:
+  1. It snapshots the marked objects and unmarks them.
+  2. It marks again from the roots.
+  3. It counts the objects the second mark finds live that the snapshot lacks (misses), and the
+     reverse (floating).
+  4. It keeps the union of both marks, so a miss never frees a live object.
+
+  It prints up to five misses and three floating objects per collection, then one line:
+
+  ```text
+  [GCV] run=12 objects=... marked=... injected=0 misses=0 dropped_dead=0 floating=...
+  ```
+
+  - Until the incremental marker exists, the mark under test is the stop-the-world mark itself, so
+    `misses` must be 0.
+  - `floating` counts blocks that were already `HB_Alive` before `Mark()` ran (created since the
+    previous collection) but are unreachable.
+    - In practice these are size-1 slots that stand alone in the heap, for example field slots left
+      behind when `SetReflection` restamps an object header to one block.
+    - The union keeps them for one more collection, the same lifetime as with verify off.
+    - Once the incremental marker exists, `floating` will also include genuine floating garbage.
+  - `NANOCLR_GC_VERIFY_INJECT=N` drops every Nth marked object from the snapshot, which tests the
+    detector.
+    - A dropped object that is still reachable must come back as a miss.
+    - A dropped object that lands on one of those unreachable blocks counts as `dropped_dead`, so
+      `misses + dropped_dead == injected` on every collection.
+  - Verify mode marks twice per collection, so `NANO_POSIX_GC_TIMING` mark times are not
+    comparable while it is on.
 
 ## POSIX Networking (macOS and Linux, including WSL)
 

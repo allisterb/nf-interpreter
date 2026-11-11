@@ -216,6 +216,7 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteGarbageCollection()
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Prepare);
 
     Mark();
+    NANOCLR_GC_ON_MARKED()
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Mark);
     MarkWeak();
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_MarkWeak);

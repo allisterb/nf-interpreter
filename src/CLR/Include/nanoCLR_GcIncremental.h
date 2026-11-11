@@ -41,6 +41,8 @@ void GcIncremental_OnHeapInitialized();
 void GcIncremental_OnHeapCompacted();
 // Start of a stop-the-world mark.
 void GcIncremental_OnFullMark();
+// Mark() has finished: verify mode checks its result here.
+void GcIncremental_OnMarked();
 
 #define NANOCLR_GC_PRE_WRITE(slot)                                                                                     \
     {                                                                                                                  \
@@ -75,6 +77,7 @@ void GcIncremental_OnFullMark();
 #define NANOCLR_GC_ON_HEAP_INITIALIZED()     GcIncremental_OnHeapInitialized();
 #define NANOCLR_GC_ON_HEAP_COMPACTED()       GcIncremental_OnHeapCompacted();
 #define NANOCLR_GC_ON_FULL_MARK()            GcIncremental_OnFullMark();
+#define NANOCLR_GC_ON_MARKED()               GcIncremental_OnMarked();
 
 #else
 
@@ -87,6 +90,7 @@ void GcIncremental_OnFullMark();
 #define NANOCLR_GC_ON_HEAP_INITIALIZED()
 #define NANOCLR_GC_ON_HEAP_COMPACTED()
 #define NANOCLR_GC_ON_FULL_MARK()
+#define NANOCLR_GC_ON_MARKED()
 
 #endif // NANOCLR_GC_INCREMENTAL
 

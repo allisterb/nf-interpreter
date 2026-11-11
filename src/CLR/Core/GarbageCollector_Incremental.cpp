@@ -16,6 +16,15 @@
 // Barrier stress mode (environment variable NANOCLR_GC_BARRIER_STRESS=1) turns the barrier on for the whole run
 // without changing collection: shades are validated and counted, never marked, and each full collection checks the
 // object-start bitmap against a heap walk and prints one "[GCI]" line.
+//
+// Verify mode (NANOCLR_GC_VERIFY=1) checks a mark result against the stop-the-world mark after every Mark(): it
+// snapshots the marked objects, unmarks them, marks again from the roots and counts every object the second mark
+// finds live that the snapshot lacks (a miss), printing the first few, then one "[GCV]" line. The union of both marks
+// is kept (relinking restored weak delegate lists), so a miss never frees a live object. Until the incremental marker
+// exists (task 0002 step 4) the mark under test is the stop-the-world mark itself; NANOCLR_GC_VERIFY_INJECT=N drops
+// every Nth marked object from the snapshot to test the detector. A dropped object that is still reachable comes back
+// as a miss; one the second mark does not reach (an unreachable block that was already HB_Alive) is counted as
+// dropped_dead, so misses + dropped_dead == injected on every collection.
 
 #include "Core.h"
 
@@ -44,10 +53,16 @@ struct GcIncrementalStats
 const size_t c_slotSize = sizeof(CLR_RT_HeapBlock);
 const size_t c_bitsPerWord = 32;
 const size_t c_stressGreyCap = 65536;
+const CLR_UINT32 c_verifyReportedMisses = 5;   // misses printed in detail per collection
+const CLR_UINT32 c_verifyReportedFloating = 3; // floating objects printed in detail per collection
 
 bool s_valid;
 bool s_stress;
-uintptr_t s_base; // address of slot 0: the first cluster's payload start
+bool s_verify;
+CLR_UINT32 s_verifyInject; // drop every Nth marked object from the verify snapshot; 0 = never
+CLR_UINT32 *s_snapshot;    // verify mode: objects the mark under test marked
+CLR_UINT32 *s_dropped;     // verify mode with injection: marked objects dropped from the snapshot
+uintptr_t s_base;          // address of slot 0: the first cluster's payload start
 uintptr_t s_end;
 size_t s_slots;
 CLR_UINT32 *s_starts;    // object-start bitmap
@@ -281,6 +296,173 @@ void VerifyStarts(CLR_UINT32 &missing, CLR_UINT32 &orphans, CLR_UINT32 &stale, C
     NANOCLR_FOREACH_NODE_END();
 }
 
+bool EnvFlag(const char *name)
+{
+    const char *value = getenv(name);
+
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+// Calls f(obj, slot) for every object block in the heap walk.
+template <typename F> void ForEachObject(F f)
+{
+    NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
+    {
+        for (CLR_RT_HeapBlock_Node *ptr = hc->m_payloadStart; ptr < hc->m_payloadEnd; ptr += ptr->DataSize())
+        {
+            if (IsObjectBlock(ptr))
+            {
+                f(ptr, (size_t)SlotIndex(ptr));
+            }
+        }
+    }
+    NANOCLR_FOREACH_NODE_END();
+}
+
+// Prints one object: slot, data type, flags, size and, for classes, value types and arrays, the managed type.
+void ReportObject(const char *kind, CLR_RT_HeapBlock *obj, size_t slot)
+{
+    char name[256] = "";
+    char *sz = name;
+    size_t cb = MAXSTRLEN(name);
+    NanoCLRDataType dt = obj->DataType();
+
+    if ((dt == DATATYPE_CLASS || dt == DATATYPE_VALUETYPE) && obj->IsAGenericInstance())
+    {
+        g_CLR_RT_TypeSystem.BuildTypeName(obj->ObjectGenericType(), sz, cb, 0);
+    }
+    else if (dt == DATATYPE_CLASS || dt == DATATYPE_VALUETYPE)
+    {
+        g_CLR_RT_TypeSystem.BuildTypeName(obj->ObjectCls(), sz, cb);
+    }
+    else if (dt == DATATYPE_SZARRAY)
+    {
+        CLR_RT_TypeDef_Instance element{};
+        CLR_UINT32 levels;
+
+        if (element.InitializeFromReflection(((CLR_RT_HeapBlock_Array *)obj)->ReflectionData(), &levels))
+        {
+            g_CLR_RT_TypeSystem.BuildTypeName(element, sz, cb, CLR_RT_TypeSystem::TYPENAME_FLAGS_FULL, levels);
+        }
+    }
+
+    name[MAXSTRLEN(name)] = 0;
+
+    CLR_Debug::Printf(
+        "[GCV] %s: slot=%u type=0x%02x flags=0x%02x size=%u %s\r\n",
+        kind,
+        (unsigned)slot,
+        (unsigned)dt,
+        (unsigned)obj->DataFlags(),
+        (unsigned)obj->DataSize(),
+        name);
+}
+
+// Verify mode: checks the current mark against a second stop-the-world mark. Runs right after Mark().
+void VerifyMark()
+{
+    CLR_UINT32 objects = 0;
+    CLR_UINT32 marked = 0;
+    CLR_UINT32 injected = 0;
+    CLR_UINT32 misses = 0;
+    CLR_UINT32 floating = 0;
+    CLR_UINT32 droppedDead = 0;
+
+    memset(s_snapshot, 0, BitmapWords() * sizeof(*s_snapshot));
+
+    if (s_dropped)
+    {
+        memset(s_dropped, 0, BitmapWords() * sizeof(*s_dropped));
+    }
+
+    // Snapshot the mark under test, then unmark it. Event blocks are left alone: they are permanently HB_Alive, the
+    // marker never traces through them, and unmarking one would get it freed by this collection's sweep.
+    ForEachObject([&](CLR_RT_HeapBlock *obj, size_t i) {
+        objects++;
+
+        if (obj->IsAlive())
+        {
+            marked++;
+
+            if (s_dropped && marked % s_verifyInject == 0)
+            {
+                injected++;
+                SetBit(s_dropped, i);
+            }
+            else
+            {
+                SetBit(s_snapshot, i);
+            }
+
+            obj->MarkDead();
+        }
+    });
+
+    // Mark again from the roots without the finalizer pass. The finalizer pass has already run (in step 3, inside the
+    // Mark() under test; the incremental final pause must also run it before verifying), so this collection's dead
+    // finalizable objects are in m_finalizersPending, which Mark() marks as roots. Running the pass again would
+    // queue for finalization any object the mark under test kept but this mark failed to reach.
+    CLR_RT_DblLinkedList &finalizersAlive = g_CLR_RT_ExecutionEngine.m_finalizersAlive;
+    CLR_RT_DblLinkedList aside;
+    aside.DblLinkedList_Initialize();
+
+    while (CLR_RT_HeapBlock_Node *fin = finalizersAlive.ExtractFirstNode())
+    {
+        aside.LinkAtBack(fin);
+    }
+
+    g_CLR_RT_GarbageCollector.Mark();
+
+    while (CLR_RT_HeapBlock_Node *fin = aside.ExtractFirstNode())
+    {
+        finalizersAlive.LinkAtBack(fin);
+    }
+
+    // Compare, keeping the union of both marks.
+    ForEachObject([&](CLR_RT_HeapBlock *obj, size_t i) {
+        bool inSnapshot = TestBit(s_snapshot, i);
+
+        if (obj->IsAlive() && !inSnapshot)
+        {
+            if (misses++ < c_verifyReportedMisses)
+            {
+                ReportObject("miss", obj, i);
+            }
+        }
+        else if (!obj->IsAlive() && inSnapshot)
+        {
+            obj->MarkAlive();
+
+            if (floating++ < c_verifyReportedFloating)
+            {
+                ReportObject("floating", obj, i);
+            }
+
+            // The sweep keeps a weak delegate list's delegates alive only for lists the mark linked as reachable.
+            if (obj->DataType() == DATATYPE_DELEGATELIST_HEAD &&
+                (((CLR_RT_HeapBlock_Delegate_List *)obj)->m_flags & CLR_RT_HeapBlock_Delegate_List::c_Weak))
+            {
+                obj->ClearData();
+                g_CLR_RT_GarbageCollector.m_weakDelegates_Reachable.LinkAtBack((CLR_RT_HeapBlock_Node *)obj);
+            }
+        }
+        else if (!obj->IsAlive() && s_dropped && TestBit(s_dropped, i))
+        {
+            droppedDead++;
+        }
+    });
+
+    CLR_Debug::Printf(
+        "[GCV] run=%u objects=%u marked=%u injected=%u misses=%u dropped_dead=%u floating=%u\r\n",
+        (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
+        (unsigned)objects,
+        (unsigned)marked,
+        (unsigned)injected,
+        (unsigned)misses,
+        (unsigned)droppedDead,
+        (unsigned)floating);
+}
+
 } // namespace
 
 void GcIncremental_PreWrite(const CLR_RT_HeapBlock *slot)
@@ -399,7 +581,19 @@ void GcIncremental_OnHeapInitialized()
         platform_free(s_grey);
     }
 
-    s_starts = s_allocated = nullptr;
+    if (s_snapshot)
+    {
+        platform_free(s_snapshot);
+    }
+
+    if (s_dropped)
+    {
+        platform_free(s_dropped);
+    }
+
+    s_verify = false;
+    s_verifyInject = 0;
+    s_starts = s_allocated = s_snapshot = s_dropped = nullptr;
     s_grey = nullptr;
     s_greyCount = s_greyCapacity = 0;
     s_stats = {};
@@ -438,13 +632,41 @@ void GcIncremental_OnHeapInitialized()
     s_valid = true;
     RebuildStarts();
 
-    const char *stress = getenv("NANOCLR_GC_BARRIER_STRESS");
-    s_stress = stress != nullptr && stress[0] != '\0' && strcmp(stress, "0") != 0;
+    s_stress = EnvFlag("NANOCLR_GC_BARRIER_STRESS");
 
     if (s_stress)
     {
         CLR_Debug::Printf("[GCI] barrier stress on: slots=%u\r\n", (unsigned)s_slots);
         g_GcIncremental_BarrierActive = true;
+    }
+
+    if (EnvFlag("NANOCLR_GC_VERIFY"))
+    {
+        const char *inject = getenv("NANOCLR_GC_VERIFY_INJECT");
+
+        s_snapshot = (CLR_UINT32 *)platform_malloc(BitmapWords() * sizeof(*s_snapshot));
+        s_verifyInject = inject ? (CLR_UINT32)strtoul(inject, nullptr, 10) : 0;
+
+        if (s_verifyInject != 0)
+        {
+            s_dropped = (CLR_UINT32 *)platform_malloc(BitmapWords() * sizeof(*s_dropped));
+        }
+
+        s_verify = s_snapshot != nullptr && (s_verifyInject == 0 || s_dropped != nullptr);
+
+        CLR_Debug::Printf(
+            s_verify ? "[GCV] verify on: inject=%u\r\n" : "[GCV] no host memory for the verify bitmaps; verify off\r\n",
+            (unsigned)s_verifyInject);
+    }
+}
+
+void GcIncremental_OnMarked()
+{
+    NATIVE_PROFILE_CLR_CORE();
+
+    if (s_valid && s_verify)
+    {
+        VerifyMark();
     }
 }
 
