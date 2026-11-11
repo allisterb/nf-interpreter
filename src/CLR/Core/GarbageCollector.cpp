@@ -222,6 +222,7 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteGarbageCollection()
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_MarkWeak);
     Sweep();
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Sweep);
+    NANOCLR_GC_ON_SWEPT()
 
     Heap_ComputeAliveVsDeadRatio();
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Ratio);

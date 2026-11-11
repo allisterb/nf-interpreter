@@ -888,7 +888,14 @@ struct CLR_RT_HeapBlock
 
     bool IsAlive() const
     {
+#if defined(NANOCLR_GC_INCREMENTAL)
+        // From an incremental cycle's final pause to its sweep, the cycle's mark bitmap counts as HB_Alive. Free blocks
+        // are excluded: EventCache_Cleanup frees cached blocks that may carry root-slot bits, without clearing them.
+        return IsFlagSet(HB_Alive) || (g_GcIncremental_LiveBits != nullptr && DataType() != DATATYPE_FREEBLOCK &&
+                                       GcIncremental_IsLive(this, sizeof(*this)));
+#else
         return IsFlagSet(HB_Alive);
+#endif
     }
     bool IsEvent() const
     {

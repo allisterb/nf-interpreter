@@ -168,11 +168,15 @@ IPv4 addresses exposed by the managed snapshot.
   - Each finished cycle prints one line:
 
     ```text
-    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... transfer_us=... total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=...
+    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=...
     ```
 
     - `final_mark_us` is the final pause's marking: draining what is still grey, the finalizer
-      pass, and `transfer_us`, which is the heap walk that copies the cycle's mark into `HB_Alive`.
+      pass, and `live_us`, which builds the live bitmap (marked or allocated during the cycle).
+    - `sweep_us` is the rest of the final pause: weak references and the sweep, which reads
+      liveness from the live bitmap rather than from a heap walk that copies it into `HB_Alive`.
+      With `NANOCLR_GC_VERIFY=1` it includes verify mode's second mark.
+    - `total_ms` runs from the initial pause to the end of the sweep.
     - `final_scanned` counts the objects still grey at that point. It is 0 when the slices kept up.
 - `NANOCLR_GC_BARRIER_STRESS=1` in the environment turns the barrier on for the whole run. Shades are
   validated and counted but never marked, and each collection checks the object-start bitmap against
@@ -201,11 +205,19 @@ IPv4 addresses exposed by the managed snapshot.
   It prints up to five misses and three floating objects per collection, then one line:
 
   ```text
-  [GCV] run=12 objects=... marked=... injected=0 misses=0 dropped_dead=0 floating=...
+  [GCV] run=12 objects=... marked=... injected=0 misses=0 dropped_dead=0 floating=... stray_alive=0
   ```
 
   - After an incremental cycle, the mark under test is the cycle's. Otherwise it is the
     stop-the-world mark itself. `misses` must be 0 either way.
+  - `stray_alive` must be 0. After a cycle, it counts blocks that carried `HB_Alive` outside the
+    cycle's mark and hold something the marker traces (class and value-type fields, reference
+    arrays, delegates, reference slots). Blocks that hold nothing traced are not counted: the
+    stand-alone slots described below, and `System.Type` objects, which `Type.GetTypeFromHandle`
+    fills by copying a whole slot, flags included. Verify after a cycle frees stand-alone slots at
+    once rather than one collection later. With verify off, the sweep
+    would keep such an object without its references having been traced. Verify unmarks it first,
+    so a reachable one is also counted in `misses`. Without a cycle it is always 0.
   - Without a cycle, `floating` counts unreachable blocks that were already `HB_Alive` before
     `Mark()` ran (created since the previous collection).
     - In practice these are size-1 slots that stand alone in the heap, for example field slots left

@@ -31,14 +31,21 @@
 // has been allocated since the last collection, the next quantum boundary takes the initial pause: the roots of
 // Mark() are snapshotted onto the grey stack and the barrier turns on. Each later quantum boundary scans up to
 // NANOCLR_GC_INCREMENTAL_SLICE slots (default 4096) of grey objects. When the grey stack is empty, a full collection
-// runs, and its Mark() is replaced by the final pause: drain, finalizer pass, then transfer of the cycle's mark bitmap
-// (plus objects allocated during the cycle) to HB_Alive for MarkWeak and the sweep. A collection requested mid-cycle
-// (GC.Collect, an allocation failure) discards the cycle and runs Mark(), for the exact result. Weak delegate lists are
-// traced as strong during a cycle, so while cycles keep running their targets are collected only by a collection that
-// runs without one. Compaction aborts a cycle, as does a lost grey push (the final pause then runs Mark()). Each
-// finished cycle prints one "[GCC]" line. GC-stress mode (NANOCLR_GC_INCREMENTAL_STRESS=N) also starts a cycle or runs
-// a slice every N object allocations, from inside the allocator, so marking interleaves with native code as well as
-// with IL.
+// runs, and its Mark() is replaced by the final pause: drain, finalizer pass, then the cycle's mark bitmap (plus
+// objects allocated during the cycle) is published as g_GcIncremental_LiveBits. IsAlive() reads it until the sweep is
+// done, so MarkWeak and the sweep see the cycle's mark without a heap walk copying it into HB_Alive. That relies on the
+// invariant Mark() already needs: outside a collection no non-event object carries HB_Alive, or Mark() would not trace
+// it. The known exceptions hold nothing the marker traces, and both marks keep them for one more collection (verify
+// after a cycle frees them at once): orphan slots (field slots left as blocks of their own when SetReflection restamps
+// an object header to one block) and REFLECTION objects, which Type.GetTypeFromHandle fills with a whole-id copy.
+// Verify mode counts any block holding something traced that breaks the invariant as stray_alive.
+//
+// A collection requested mid-cycle (GC.Collect, an allocation failure) discards the cycle and runs Mark(), for the
+// exact result. Weak delegate lists are traced as strong during a cycle, so while cycles keep running their targets are
+// collected only by a collection that runs without one. Compaction aborts a cycle, as does a lost grey push (the final
+// pause then runs Mark()). Each finished cycle prints one "[GCC]" line after its sweep. GC-stress mode
+// (NANOCLR_GC_INCREMENTAL_STRESS=N) also starts a cycle or runs a slice every N object allocations, from inside the
+// allocator, so marking interleaves with native code as well as with IL.
 
 #include "Core.h"
 
@@ -49,6 +56,9 @@
 #include <time.h>
 
 bool g_GcIncremental_BarrierActive;
+const CLR_UINT32 *g_GcIncremental_LiveBits;
+uintptr_t g_GcIncremental_LiveBase;
+size_t g_GcIncremental_LiveSlots;
 
 namespace
 {
@@ -69,9 +79,11 @@ struct GcIncrementalStats
 struct GcIncrementalCycle
 {
     uint64_t startNs;
-    uint64_t initialNs;  // initial pause: root snapshot
-    uint64_t sliceMaxNs; // longest mark slice
-    uint64_t finalNs;    // final pause, mark part: drain, finalizer pass, transfer (sweep not included)
+    uint64_t initialNs;   // initial pause: root snapshot
+    uint64_t sliceMaxNs;  // longest mark slice
+    uint64_t finalNs;     // final pause, mark part: drain, finalizer pass, live bitmap (sweep not included)
+    uint64_t liveNs;      // building the live bitmap (marked | allocated)
+    uint64_t markedEndNs; // end of the mark part; the rest of the final pause is MarkWeak and the sweep
     CLR_UINT32 slices;
     CLR_UINT32 rootBlocks;
     CLR_UINT32 scannedObjects;
@@ -104,7 +116,8 @@ uintptr_t s_end;
 size_t s_slots;
 CLR_UINT32 *s_starts;    // object-start bitmap
 CLR_UINT32 *s_allocated; // allocated-this-cycle bitmap
-CLR_UINT32 *s_marked;    // incremental cycle: shaded (grey or black) objects and marked root slots
+CLR_UINT32 *s_marked;    // incremental cycle: shaded (grey or black) objects and marked root slots; from the final
+                         // pause to the sweep, the live bitmap (marked | allocated)
 const CLR_RT_HeapBlock **s_grey;
 size_t s_greyCount;
 size_t s_greyCapacity;
@@ -116,6 +129,7 @@ bool s_incremental;        // NANOCLR_GC_INCREMENTAL=1: run incremental cycles
 bool s_cycleActive;        // between the initial and the final pause
 bool s_greyOverflow;       // a grey push was lost during the cycle: the final pause falls back to Mark()
 bool s_ownFinalPause;      // the collection running is the final pause OnQuantum requested (grey stack empty)
+bool s_sweepPending;       // a finished cycle's live bitmap is published until the sweep is done (OnSwept)
 size_t s_triggerSlots;     // start a cycle once this many slots were allocated since the last collection
 size_t s_sliceSlots;       // marking budget per quantum, in slots scanned
 size_t s_allocatedSinceGc; // object slots allocated since the last collection
@@ -432,6 +446,32 @@ size_t ScanObject(const CLR_RT_HeapBlock *obj)
     return s_cycle.scannedSlots - before + 1;
 }
 
+// True if ScanObject traces anything in obj. Keep in step with ScanObject.
+bool HoldsTracedSlots(const CLR_RT_HeapBlock *obj)
+{
+    switch (obj->DataType())
+    {
+        case DATATYPE_SZARRAY:
+        {
+            auto *array = (CLR_RT_HeapBlock_Array *)obj;
+
+            return array->IsStoragePointer() || array->m_fReference;
+        }
+
+        case DATATYPE_CLASS:
+        case DATATYPE_VALUETYPE:
+        case DATATYPE_DELEGATE_HEAD:
+        case DATATYPE_DELEGATELIST_HEAD:
+        case DATATYPE_OBJECT:
+        case DATATYPE_BYREF:
+        case DATATYPE_ARRAY_BYREF:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
 // Scans grey objects (and the partial array first) until both are exhausted or about budget slots were scanned.
 // Returns true when no grey work is left.
 bool Drain(size_t budget)
@@ -576,12 +616,18 @@ void StartCycle()
     s_cycle.initialNs = NowNs() - s_cycle.startNs;
 }
 
-void EndCycle()
+// Ends marking: the barrier goes back to its idle state. The bitmaps are left to the caller.
+void StopMarking()
 {
     s_cycleActive = false;
     g_GcIncremental_BarrierActive = s_stress;
     s_greyCount = 0;
     s_partialArray = nullptr;
+}
+
+void EndCycle()
+{
+    StopMarking();
     ClearCycleBitmaps();
 }
 
@@ -780,6 +826,34 @@ void VerifyMark()
     CLR_UINT32 misses = 0;
     CLR_UINT32 floating = 0;
     CLR_UINT32 droppedDead = 0;
+    CLR_UINT32 stray = 0;
+
+    if (g_GcIncremental_LiveBits != nullptr)
+    {
+        // A finished cycle: verify works on HB_Alive, so copy the live bitmap into it and stop publishing the bitmap
+        // (OnSwept still retires it). Every object outside the bitmap is unmarked, as the cycle's mark leaves it, so a
+        // reachable one comes back as a miss (and orphan slots are freed at once rather than one collection later). A
+        // block holding something the marker traces that carried HB_Alive anyway breaks the invariant the published
+        // bitmap relies on (the sweep would have kept it, with its references untraced), and is counted. Blocks holding
+        // nothing traced are harmless: I4 orphan slots, born alive, and REFLECTION objects, which
+        // Type.GetTypeFromHandle fills with a whole-id copy of its argument, flags included.
+        g_GcIncremental_LiveBits = nullptr;
+
+        ForEachObject([&](CLR_RT_HeapBlock *obj, size_t i) {
+            if (TestBit(s_marked, i))
+            {
+                obj->MarkAlive();
+                return;
+            }
+
+            if (obj->IsAlive() && HoldsTracedSlots(obj) && stray++ < c_verifyReportedMisses)
+            {
+                ReportObject("stray", obj, i);
+            }
+
+            obj->MarkDead();
+        });
+    }
 
     memset(s_snapshot, 0, BitmapWords() * sizeof(*s_snapshot));
 
@@ -867,14 +941,15 @@ void VerifyMark()
     });
 
     CLR_Debug::Printf(
-        "[GCV] run=%u objects=%u marked=%u injected=%u misses=%u dropped_dead=%u floating=%u\r\n",
+        "[GCV] run=%u objects=%u marked=%u injected=%u misses=%u dropped_dead=%u floating=%u stray_alive=%u\r\n",
         (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
         (unsigned)objects,
         (unsigned)marked,
         (unsigned)injected,
         (unsigned)misses,
         (unsigned)droppedDead,
-        (unsigned)floating);
+        (unsigned)floating,
+        (unsigned)stray);
 }
 
 } // namespace
@@ -992,6 +1067,8 @@ void GcIncremental_OnHeapInitialized()
 
     s_valid = false;
     g_GcIncremental_BarrierActive = false;
+    g_GcIncremental_LiveBits = nullptr;
+    s_sweepPending = false;
     s_cycleActive = false;
     s_incremental = false;
     s_allocatedSinceGc = 0;
@@ -1179,46 +1256,28 @@ bool GcIncremental_FinishCycle()
     }
 
     s_cycle.finalScannedObjects = s_cycle.scannedObjects - scannedBefore;
-    uint64_t transferStart = NowNs();
+    uint64_t liveStart = NowNs();
 
-    // Transfer: the cycle's mark becomes HB_Alive on every non-event block, for MarkWeak and the sweep.
-    ForEachObject([](CLR_RT_HeapBlock *obj, size_t i) {
-        if (TestBit(s_marked, i) || TestBit(s_allocated, i))
-        {
-            obj->MarkAlive();
-        }
-        else
-        {
-            obj->MarkDead();
-        }
-    });
+    // The live bitmap: marked or allocated black. It is published for IsAlive() until OnSwept, in place of a heap walk
+    // setting HB_Alive: MarkWeak and the sweep read it, and the sweep's own walk does the rest.
+    for (size_t w = 0, words = BitmapWords(); w < words; w++)
+    {
+        s_marked[w] |= s_allocated[w];
+    }
+
+    StopMarking();
+    g_GcIncremental_LiveBase = s_base;
+    g_GcIncremental_LiveSlots = s_slots;
+    g_GcIncremental_LiveBits = s_marked;
+    s_sweepPending = true;
 
     // Weak delegate lists were traced as strong, so the sweep has no weak lists to process. Their targets die only in a
     // collection that runs without a cycle (Mark()).
     g_CLR_RT_GarbageCollector.m_weakDelegates_Reachable.DblLinkedList_Initialize();
 
-    uint64_t end = NowNs();
-    s_cycle.finalNs = end - start;
-
-    CLR_Debug::Printf(
-        "[GCC] cycle=%u run=%u slices=%u initial_us=%u slice_max_us=%u final_mark_us=%u transfer_us=%u total_ms=%u "
-        "roots=%u scanned=%u slots=%u final_scanned=%u allocated_black=%u grey_max=%u\r\n",
-        (unsigned)s_cycleCount,
-        (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
-        (unsigned)s_cycle.slices,
-        (unsigned)(s_cycle.initialNs / 1000),
-        (unsigned)(s_cycle.sliceMaxNs / 1000),
-        (unsigned)(s_cycle.finalNs / 1000),
-        (unsigned)((end - transferStart) / 1000),
-        (unsigned)((NowNs() - s_cycle.startNs) / 1000000),
-        (unsigned)s_cycle.rootBlocks,
-        (unsigned)s_cycle.scannedObjects,
-        (unsigned)s_cycle.scannedSlots,
-        (unsigned)s_cycle.finalScannedObjects,
-        (unsigned)s_cycle.allocatedBlack,
-        (unsigned)s_cycle.greyMax);
-
-    EndCycle();
+    s_cycle.markedEndNs = NowNs();
+    s_cycle.liveNs = s_cycle.markedEndNs - liveStart;
+    s_cycle.finalNs = s_cycle.markedEndNs - start;
 
     return true;
 }
@@ -1277,6 +1336,41 @@ void GcIncremental_OnMarked()
     }
 }
 
+void GcIncremental_OnSwept()
+{
+    NATIVE_PROFILE_CLR_CORE();
+
+    if (!s_sweepPending)
+    {
+        return;
+    }
+
+    g_GcIncremental_LiveBits = nullptr;
+    s_sweepPending = false;
+    ClearCycleBitmaps();
+
+    uint64_t end = NowNs();
+
+    CLR_Debug::Printf(
+        "[GCC] cycle=%u run=%u slices=%u initial_us=%u slice_max_us=%u final_mark_us=%u live_us=%u sweep_us=%u "
+        "total_ms=%u roots=%u scanned=%u slots=%u final_scanned=%u allocated_black=%u grey_max=%u\r\n",
+        (unsigned)s_cycleCount,
+        (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
+        (unsigned)s_cycle.slices,
+        (unsigned)(s_cycle.initialNs / 1000),
+        (unsigned)(s_cycle.sliceMaxNs / 1000),
+        (unsigned)(s_cycle.finalNs / 1000),
+        (unsigned)(s_cycle.liveNs / 1000),
+        (unsigned)((end - s_cycle.markedEndNs) / 1000),
+        (unsigned)((end - s_cycle.startNs) / 1000000),
+        (unsigned)s_cycle.rootBlocks,
+        (unsigned)s_cycle.scannedObjects,
+        (unsigned)s_cycle.scannedSlots,
+        (unsigned)s_cycle.finalScannedObjects,
+        (unsigned)s_cycle.allocatedBlack,
+        (unsigned)s_cycle.greyMax);
+}
+
 void GcIncremental_OnHeapCompacted()
 {
     if (s_valid)
@@ -1323,6 +1417,17 @@ void GcIncremental_OnFullMark()
 
     s_stats = {};
     s_allocatedSinceGc = 0;
+
+    // A live bitmap is published only from FinishCycle to OnSwept of one collection. Reaching this means a collection
+    // nested inside that window, which breaks the outer sweep (as any nested collection does); report it loudly.
+    if (s_sweepPending)
+    {
+        CLR_Debug::Printf("[GCC] ERROR: collection nested in an incremental cycle's sweep; heap state unreliable\r\n");
+        _ASSERTE(false);
+        g_GcIncremental_LiveBits = nullptr;
+        s_sweepPending = false;
+        ClearCycleBitmaps();
+    }
 
     // With a cycle active, this collection is its final pause (GcIncremental_FinishCycle), which needs the grey stack
     // and the bitmaps. Otherwise any barrier work (stress mode) is simply discarded.

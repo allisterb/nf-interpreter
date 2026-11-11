@@ -14,6 +14,7 @@
 #if defined(NANOCLR_GC_INCREMENTAL)
 
 #include <stddef.h>
+#include <stdint.h>
 
 struct CLR_RT_HeapBlock;
 
@@ -24,6 +25,30 @@ extern __attribute__((visibility("hidden"))) bool g_GcIncremental_BarrierActive;
 #else
 extern bool g_GcIncremental_BarrierActive;
 #endif
+
+// Live bitmap of the incremental cycle being swept, or null. Published from the end of the final pause until Sweep()
+// returns (verify mode unpublishes it earlier, after copying it into HB_Alive), so MarkWeak() and Sweep() read the
+// cycle's mark through IsAlive() instead of a heap walk copying it into HB_Alive. Bit i covers the block at
+// g_GcIncremental_LiveBase + i blocks.
+#if defined(__GNUC__)
+extern __attribute__((visibility("hidden"))) const CLR_UINT32 *g_GcIncremental_LiveBits;
+extern __attribute__((visibility("hidden"))) uintptr_t g_GcIncremental_LiveBase;
+extern __attribute__((visibility("hidden"))) size_t g_GcIncremental_LiveSlots;
+#else
+extern const CLR_UINT32 *g_GcIncremental_LiveBits;
+extern uintptr_t g_GcIncremental_LiveBase;
+extern size_t g_GcIncremental_LiveSlots;
+#endif
+
+// True if the block at p, of blockSize bytes, is set in g_GcIncremental_LiveBits (which must be non-null).
+inline bool GcIncremental_IsLive(const void *p, size_t blockSize)
+{
+    const uintptr_t offset = (uintptr_t)p - g_GcIncremental_LiveBase;
+    const size_t i = offset / blockSize;
+
+    return offset % blockSize == 0 && i < g_GcIncremental_LiveSlots &&
+           ((g_GcIncremental_LiveBits[i / 32] >> (i % 32)) & 1);
+}
 
 // Deletion barrier: before *slot is overwritten, shade the object it references.
 void GcIncremental_PreWrite(const CLR_RT_HeapBlock *slot);
@@ -43,11 +68,13 @@ void GcIncremental_OnHeapCompacted();
 void GcIncremental_OnFullMark();
 // Mark() has finished: verify mode checks its result here.
 void GcIncremental_OnMarked();
+// Sweep() has finished: an incremental cycle's live bitmap is retired here.
+void GcIncremental_OnSwept();
 
 // Incremental cycle. FinishCycle runs in place of Mark() in a full collection: with a cycle active it completes the
-// cycle's mark (drain, finalizer pass, transfer to HB_Alive) and returns true. It returns false, and Mark() runs, when
-// no cycle is active, the cycle lost a grey push, or the collection is not the cycle's own final pause (GC.Collect or
-// an allocation failure mid-cycle discards the cycle for the exact stop-the-world result).
+// cycle's mark (drain, finalizer pass, publishing g_GcIncremental_LiveBits) and returns true. It returns false, and
+// Mark() runs, when no cycle is active, the cycle lost a grey push, or the collection is not the cycle's own final
+// pause (GC.Collect or an allocation failure mid-cycle discards the cycle for the exact stop-the-world result).
 bool GcIncremental_FinishCycle();
 // A thread quantum has ended: start a cycle, run a mark slice, or request the final pause.
 void GcIncremental_OnQuantum();
@@ -88,6 +115,7 @@ void GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_HEAP_COMPACTED()       GcIncremental_OnHeapCompacted();
 #define NANOCLR_GC_ON_FULL_MARK()            GcIncremental_OnFullMark();
 #define NANOCLR_GC_ON_MARKED()               GcIncremental_OnMarked();
+#define NANOCLR_GC_ON_SWEPT()                GcIncremental_OnSwept();
 #define NANOCLR_GC_ON_QUANTUM()              GcIncremental_OnQuantum();
 #define NANOCLR_GC_ON_COMPACTION()           GcIncremental_OnCompaction();
 #define NANOCLR_GC_MARK()                                                                                              \
@@ -110,6 +138,7 @@ void GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_HEAP_COMPACTED()
 #define NANOCLR_GC_ON_FULL_MARK()
 #define NANOCLR_GC_ON_MARKED()
+#define NANOCLR_GC_ON_SWEPT()
 #define NANOCLR_GC_ON_QUANTUM()
 #define NANOCLR_GC_ON_COMPACTION()
 #define NANOCLR_GC_MARK() Mark();
