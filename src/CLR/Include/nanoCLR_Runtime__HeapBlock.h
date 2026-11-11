@@ -6,39 +6,47 @@
 #ifndef NANOCLR_RUNTIME__HEAPBLOCK_H
 #define NANOCLR_RUNTIME__HEAPBLOCK_H
 
+#include <nanoCLR_GcIncremental.h>
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #define CLR_RT_HEAPBLOCK_RAW_ID(dataType, flags, size)                                                                 \
     ((dataType & 0x000000FF) | ((flags & 0x000000FF) << 8) | ((size & 0x0000FFFF) << 16))
 #define CLR_RT_HEAPBLOCK_ASSIGN_INTEGER32_SIGNED(dataType, num)                                                        \
     {                                                                                                                  \
+        NANOCLR_GC_PRE_WRITE(this)                                                                                     \
         m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(dataType, 0, 1);                                                            \
         m_data.numeric.s4 = (CLR_INT32)num;                                                                            \
     }
 #define CLR_RT_HEAPBLOCK_ASSIGN_INTEGER64_SIGNED(dataType, num)                                                        \
     {                                                                                                                  \
+        NANOCLR_GC_PRE_WRITE(this)                                                                                     \
         m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(dataType, 0, 1);                                                            \
         m_data.numeric.s8 = num;                                                                                       \
     }
 
 #define CLR_RT_HEAPBLOCK_ASSIGN_INTEGER32_UNSIGNED(dataType, num)                                                      \
     {                                                                                                                  \
+        NANOCLR_GC_PRE_WRITE(this)                                                                                     \
         m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(dataType, 0, 1);                                                            \
         m_data.numeric.u4 = (CLR_UINT32)num;                                                                           \
     }
 #define CLR_RT_HEAPBLOCK_ASSIGN_INTEGER64_UNSIGNED(dataType, num)                                                      \
     {                                                                                                                  \
+        NANOCLR_GC_PRE_WRITE(this)                                                                                     \
         m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(dataType, 0, 1);                                                            \
         m_data.numeric.u8 = num;                                                                                       \
     }
 
 #define CLR_RT_HEAPBLOCK_ASSIGN_FLOAT32(dataType, num)                                                                 \
     {                                                                                                                  \
+        NANOCLR_GC_PRE_WRITE(this)                                                                                     \
         m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(dataType, 0, 1);                                                            \
         m_data.numeric.r4 = num;                                                                                       \
     }
 #define CLR_RT_HEAPBLOCK_ASSIGN_FLOAT64(dataType, num)                                                                 \
     {                                                                                                                  \
+        NANOCLR_GC_PRE_WRITE(this)                                                                                     \
         m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(dataType, 0, 1);                                                            \
         m_data.numeric.r8 = num;                                                                                       \
     }
@@ -1022,6 +1030,7 @@ struct CLR_RT_HeapBlock
 
     void SetObjectReference(const CLR_RT_HeapBlock *ptr)
     {
+        NANOCLR_GC_PRE_WRITE(this)
         m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_OBJECT, 0, 1);
         m_data.objectReference.ptr = (CLR_RT_HeapBlock *)ptr;
     }
@@ -1068,6 +1077,7 @@ struct CLR_RT_HeapBlock
             obj = &dst;
         }
 
+        NANOCLR_GC_PRE_WRITE(this)
         m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_BYREF, 0, 1);
         m_data.objectReference.ptr = obj;
     }
@@ -1122,6 +1132,7 @@ struct CLR_RT_HeapBlock
 
     void SetUnmanagedPointer(const uintptr_t ptr)
     {
+        NANOCLR_GC_PRE_WRITE(this)
         m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_PTR, 0, 1);
         m_data.unmanagedPointer.ptr = ptr;
     }
@@ -1322,6 +1333,7 @@ struct CLR_RT_HeapBlock
 
         value.Debug_CheckPointer();
 
+        NANOCLR_GC_PRE_WRITE(this)
         auto *src = (CLR_RT_HeapBlock_Raw *)this;
         auto *dst = (CLR_RT_HeapBlock_Raw *)&value;
 
@@ -1332,6 +1344,7 @@ struct CLR_RT_HeapBlock
     {
         _ASSERTE(value.DataSize() == 1);
 
+        NANOCLR_GC_PRE_WRITE(this)
         this->m_data = value.m_data;
 
         if (DataType() > DATATYPE_LAST_PRIMITIVE_TO_PRESERVE)

@@ -294,6 +294,7 @@ HRESULT CLR_RT_HeapBlock_NativeEventDispatcher::RecoverManagedObject(CLR_RT_Heap
         if (ref->m_objectPtr)
         {
             event = ref->m_objectPtr;
+            NANOCLR_GC_SHADE_OBJECT(event)
             NANOCLR_SET_AND_LEAVE(S_OK);
         }
     }

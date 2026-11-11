@@ -5230,6 +5230,7 @@ HRESULT CLR_RT_AppDomain::GetManagedObject(CLR_RT_HeapBlock &res)
         if (obj && obj->ObjectCls().m_data == g_CLR_RT_WellKnownTypes.AppDomain.m_data)
         {
             // managed appDomain is found.  Use it.
+            NANOCLR_GC_SHADE_OBJECT(ref->m_objectPtr)
             res.SetObjectReference(ref->m_objectPtr);
 
             NANOCLR_SET_AND_LEAVE(S_OK);

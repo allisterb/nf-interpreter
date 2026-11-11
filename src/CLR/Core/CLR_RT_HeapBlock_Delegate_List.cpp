@@ -38,6 +38,8 @@ CLR_RT_HeapBlock *CLR_RT_HeapBlock_Delegate_List::CopyAndCompress(
         CLR_RT_HeapBlock_Delegate *dlg = src->DereferenceDelegate();
         if (dlg)
         {
+            // src may be a weak list: keep what it hands to the new (black) list alive.
+            NANOCLR_GC_SHADE_OBJECT(dlg)
             dst->SetObjectReference(dlg);
 
             dst++;

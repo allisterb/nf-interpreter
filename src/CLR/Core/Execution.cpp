@@ -210,6 +210,8 @@ HRESULT CLR_RT_ExecutionEngine::AllocateHeaps()
         i += size;
     }
 
+    NANOCLR_GC_ON_HEAP_INITIALIZED()
+
     NANOCLR_NOCLEANUP();
 }
 

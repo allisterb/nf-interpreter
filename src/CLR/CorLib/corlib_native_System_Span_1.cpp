@@ -139,6 +139,10 @@ HRESULT Library_corlib_native_System_Span_1::CopyTo___VOID__SystemSpan_1(CLR_RT_
         CLR_RT_ProtectFromGC gc1(*sourceArray);
         CLR_RT_ProtectFromGC gc2(*destinationArray);
 
+        NANOCLR_GC_SHADE_BYTES_IF(
+            sourceArray->m_sizeOfElement == sizeof(struct CLR_RT_HeapBlock),
+            destinationArray->GetElement(0),
+            sourceSpan[FIELD___length].NumericByRefConst().s4 * sourceArray->m_sizeOfElement)
         memmove(
             destinationArray->GetElement(0),
             sourceArray->GetElement(0),

@@ -191,6 +191,10 @@ HRESULT CLR_RT_HeapBlock_Array::ClearElements(int index, int length)
         NANOCLR_SET_AND_LEAVE(CLR_E_WRONG_TYPE);
     }
 
+    NANOCLR_GC_SHADE_BYTES_IF(
+        m_fReference && !GcIncremental_IsAllocatedThisCycle(this),
+        data,
+        length * m_sizeOfElement)
     CLR_RT_Memory::ZeroFill(data, length * m_sizeOfElement);
 
     if (m_fReference)

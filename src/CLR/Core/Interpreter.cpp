@@ -5201,6 +5201,7 @@ HRESULT CLR_RT_Thread::Execute_IL(CLR_RT_StackFrame &stackArg)
                     CHECKSTACK(stack, evalPos);
 
                     // perform memory move as addresses may overlap
+                    NANOCLR_GC_SHADE_BYTES((const void *)destinationAddress, size)
                     memmove((void *)destinationAddress, (const void *)sourceAddress, size);
 
                     break;

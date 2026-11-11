@@ -477,6 +477,7 @@ HRESULT Library_corlib_native_System_Threading_Thread::get_CurrentThread___STATI
 
         if (fFound)
         {
+            NANOCLR_GC_SHADE_OBJECT(pManagedThread)
             top.SetObjectReference(pManagedThread);
 
             NANOCLR_SET_AND_LEAVE(S_OK);

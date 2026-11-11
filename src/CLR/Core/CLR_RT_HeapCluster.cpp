@@ -185,6 +185,7 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
         }
 
         res->SetDataId(CLR_RT_HEAPBLOCK_RAW_ID(dataType, flags, length));
+        NANOCLR_GC_ON_ALLOCATE(res, flags)
 
         if (flags & CLR_RT_HeapBlock::HB_InitializeToZero)
         {
@@ -252,6 +253,7 @@ void CLR_RT_HeapCluster::RecoverFromGC()
 
 #endif
             ptr->SetDataId(CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_FREEBLOCK, CLR_RT_HeapBlock::HB_Pinned, lenTot));
+            NANOCLR_GC_ON_FREE(ptr, lenTot)
 
             //
             // Link to the free list.
@@ -327,6 +329,7 @@ CLR_RT_HeapBlock_Node *CLR_RT_HeapCluster::InsertInOrder(CLR_RT_HeapBlock_Node *
     }
 
     node->SetDataId(CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_FREEBLOCK, CLR_RT_HeapBlock::HB_Pinned, size));
+    NANOCLR_GC_ON_FREE(node, size)
     node->Debug_ClearBlock(SENTINEL_CLUSTER_INSERT);
 
     return node;

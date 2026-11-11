@@ -134,6 +134,8 @@ HRESULT CLR_RT_HeapBlock_Queue::ObjArrayMemcpy(
 {
     NANOCLR_HEADER();
 
+    // memcpy's destination here is arraySrc (see qflat task 0002 audit): shade what is actually overwritten.
+    NANOCLR_GC_SHADE_BYTES(arraySrc->GetElement(indexSrc), length * sizeof(struct CLR_RT_HeapBlock))
     memcpy(arraySrc->GetElement(indexSrc), arrayDst->GetElement(indexDst), length * sizeof(struct CLR_RT_HeapBlock));
 
     NANOCLR_NOCLEANUP_NOLABEL();

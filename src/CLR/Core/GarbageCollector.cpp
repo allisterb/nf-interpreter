@@ -212,6 +212,7 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteGarbageCollection()
     CLR_RT_ExecutionEngine::ExecutionConstraint_Suspend();
 
     g_CLR_RT_EventCache.EventCache_Cleanup();
+    NANOCLR_GC_ON_FULL_MARK()
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Prepare);
 
     Mark();

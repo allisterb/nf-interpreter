@@ -130,6 +130,30 @@ IPv4 addresses exposed by the managed snapshot.
   (10 MiB heap) and 2.25 s (40 MiB heap) to 5–9 ms (medians).
 - `OFF` restores the upstream behaviour.
 
+`NANO_POSIX_GC_INCREMENTAL`
+- Default: `OFF`
+- Experimental groundwork for an incremental, snapshot-at-the-beginning collector: a deletion write
+  barrier in the `CLR_RT_HeapBlock` setters and at raw heap copies, keep-alive shading where weak
+  pointers are read, and object-start / allocated-this-cycle bitmaps kept in host memory (one bit per
+  heap block each). No incremental cycle exists yet, so collection behaviour is unchanged. When `OFF`,
+  every hook compiles to nothing.
+- `NANOCLR_GC_BARRIER_STRESS=1` in the environment turns the barrier on for the whole run. Shades are
+  validated and counted but never marked, and each collection checks the object-start bitmap against
+  a heap walk and prints one line:
+
+  ```text
+  [GCI] full-mark run=12 prewrite=... shade_bytes=... weak=... pushed=... black=... rejected=... grey_dropped=... alloc_dirty=0 bitmap_missing=0 bitmap_stale=0 bitmap_interior=0
+  ```
+
+  Any non-zero `alloc_dirty`, `bitmap_missing`, `bitmap_stale` or `bitmap_interior` count is a bug: a
+  heap path that allocates or frees without updating the bitmap. `alloc_dirty` counts allocations
+  (since the last collection) whose memory still carried a bit, which allocation relies on never
+  happening. `bitmap_orphans` counts size-1 value slots standing
+  alone in the heap walk (assembly static fields, which are extracted as one run and restamped slot
+  by slot, and the tail left when `SetReflection` shrinks a two-block MethodInfo); they are expected.
+  The check walks the whole heap at the start of every collection, so do not combine stress mode
+  with `NANO_POSIX_GC_TIMING` measurements.
+
 ## POSIX Networking (macOS and Linux, including WSL)
 
 The socket scheduler, resolver, managed networking bridge and mbedTLS

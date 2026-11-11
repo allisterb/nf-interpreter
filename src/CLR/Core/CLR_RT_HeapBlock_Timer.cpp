@@ -94,6 +94,7 @@ void CLR_RT_HeapBlock_Timer::SpawnTimer(CLR_RT_Thread *th)
 
     CLR_RT_ObjectToEvent_Source *ref = (CLR_RT_ObjectToEvent_Source *)m_references.FirstValidNode();
     CLR_RT_HeapBlock *managedTimer = ref->m_objectPtr;
+    NANOCLR_GC_SHADE_OBJECT(managedTimer)
     CLR_RT_HeapBlock *callback = &managedTimer[Library_corlib_native_System_Threading_Timer::FIELD___callback];
     CLR_RT_HeapBlock *state = &managedTimer[Library_corlib_native_System_Threading_Timer::FIELD___state];
     CLR_RT_HeapBlock_Delegate *delegate = callback->DereferenceDelegate();

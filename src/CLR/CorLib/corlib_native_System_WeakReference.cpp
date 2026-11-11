@@ -95,6 +95,7 @@ void CLR_RT_HeapBlock_WeakReference::RecoverObjects(CLR_RT_DblLinkedList &lstHea
                 if (weak)
                 {
                     weak->ChangeDataType(DATATYPE_FREEBLOCK);
+                    NANOCLR_GC_ON_FREE(weak, weak->DataSize())
                 }
             }
 
@@ -142,6 +143,7 @@ HRESULT CLR_RT_HeapBlock_WeakReference::GetTarget(CLR_RT_HeapBlock &targetRefere
         }
     }
 
+    NANOCLR_GC_SHADE_OBJECT(m_targetDirect)
     targetReference.SetObjectReference(m_targetDirect);
 
     NANOCLR_NOCLEANUP_NOLABEL();
