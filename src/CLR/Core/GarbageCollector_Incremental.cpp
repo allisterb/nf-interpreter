@@ -11,7 +11,8 @@
 // start of a live object according to the object-start bitmap, which ExtractBlocks sets and every path that frees
 // heap memory clears. A false positive can then only shade a real, allocated object, which survives one more cycle.
 // Its fields are trusted by the marker like any other object's, so the incremental marker (task 0002 step 4) must
-// not see objects whose fields are not yet initialised: allocation stamps fields before anything can yield.
+// not see objects whose fields are not yet initialised: allocation stamps fields before the next allocation or quantum
+// boundary, the only points where marking runs.
 //
 // Barrier stress mode (environment variable NANOCLR_GC_BARRIER_STRESS=1) turns the barrier on for the whole run
 // without changing collection: shades are validated and counted, never marked, and each full collection checks the
@@ -32,9 +33,12 @@
 // NANOCLR_GC_INCREMENTAL_SLICE slots (default 4096) of grey objects. When the grey stack is empty, a full collection
 // runs, and its Mark() is replaced by the final pause: drain, finalizer pass, then transfer of the cycle's mark bitmap
 // (plus objects allocated during the cycle) to HB_Alive for MarkWeak and the sweep. A collection requested mid-cycle
-// finishes the cycle the same way. Weak delegate lists are traced as strong during a cycle, so while cycles keep
-// running their targets are collected only by a collection that runs without one. Compaction aborts a cycle, as does a
-// lost grey push (the final pause then runs Mark()). Each finished cycle prints one "[GCC]" line.
+// (GC.Collect, an allocation failure) discards the cycle and runs Mark(), for the exact result. Weak delegate lists are
+// traced as strong during a cycle, so while cycles keep running their targets are collected only by a collection that
+// runs without one. Compaction aborts a cycle, as does a lost grey push (the final pause then runs Mark()). Each
+// finished cycle prints one "[GCC]" line. GC-stress mode (NANOCLR_GC_INCREMENTAL_STRESS=N) also starts a cycle or runs
+// a slice every N object allocations, from inside the allocator, so marking interleaves with native code as well as
+// with IL.
 
 #include "Core.h"
 
@@ -111,9 +115,12 @@ GcIncrementalStats s_stats;
 bool s_incremental;        // NANOCLR_GC_INCREMENTAL=1: run incremental cycles
 bool s_cycleActive;        // between the initial and the final pause
 bool s_greyOverflow;       // a grey push was lost during the cycle: the final pause falls back to Mark()
+bool s_ownFinalPause;      // the collection running is the final pause OnQuantum requested (grey stack empty)
 size_t s_triggerSlots;     // start a cycle once this many slots were allocated since the last collection
 size_t s_sliceSlots;       // marking budget per quantum, in slots scanned
 size_t s_allocatedSinceGc; // object slots allocated since the last collection
+CLR_UINT32 s_stressEvery;  // GC-stress mode: an incremental step every this many object allocations; 0 = off
+CLR_UINT32 s_stressCount;
 CLR_UINT32 s_cycleCount;
 GcIncrementalCycle s_cycle;
 
@@ -589,6 +596,45 @@ void AbortCycle(const char *reason)
     EndCycle();
 }
 
+// One timed mark slice. Returns true when no grey work is left.
+bool RunSlice()
+{
+    uint64_t start = NowNs();
+    bool done = Drain(s_sliceSlots);
+    uint64_t elapsed = NowNs() - start;
+
+    s_cycle.slices++;
+
+    if (elapsed > s_cycle.sliceMaxNs)
+    {
+        s_cycle.sliceMaxNs = elapsed;
+    }
+
+    return done;
+}
+
+// GC-stress mode (NANOCLR_GC_INCREMENTAL_STRESS=N), every N object allocations, from inside the allocator: start a
+// cycle, or run one slice. The final pause is left to the next quantum boundary, never run inside the allocator.
+void StressStep()
+{
+    if (!s_incremental || g_CLR_RT_ExecutionEngine.m_heapState == CLR_RT_ExecutionEngine::c_HeapState_UnderGC)
+    {
+        return;
+    }
+
+    if (!s_cycleActive)
+    {
+        if (!CLR_EE_IS(Compaction_Pending))
+        {
+            StartCycle();
+        }
+    }
+    else if (!s_greyOverflow)
+    {
+        RunSlice();
+    }
+}
+
 void RebuildStarts()
 {
     memset(s_starts, 0, BitmapWords() * sizeof(*s_starts));
@@ -908,6 +954,16 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
         return;
     }
 
+    // GC-stress mode. It runs before the block becomes an object start, so nothing can grey it while its fields are
+    // still unzeroed, and before its colour is decided, so a cycle started here allocates it black too: nothing
+    // references it yet, and the store that will (a root write, or a field of an old object, whose barrier shades only
+    // the old value) cannot shade it.
+    if (s_stressEvery != 0 && ++s_stressCount >= s_stressEvery)
+    {
+        s_stressCount = 0;
+        StressStep();
+    }
+
     SetBit(s_starts, (size_t)i);
     s_allocatedSinceGc += block->DataSize();
 
@@ -1053,10 +1109,15 @@ void GcIncremental_OnHeapInitialized()
         s_triggerSlots = s_slots * percent / 100;
         s_sliceSlots = slice && strtoul(slice, nullptr, 10) ? strtoul(slice, nullptr, 10) : 4096;
 
+        const char *stress = getenv("NANOCLR_GC_INCREMENTAL_STRESS");
+        s_stressEvery = stress ? (CLR_UINT32)strtoul(stress, nullptr, 10) : 0;
+        s_stressCount = 0;
+
         CLR_Debug::Printf(
-            "[GCC] incremental on: trigger=%u slots slice=%u slots\r\n",
+            "[GCC] incremental on: trigger=%u slots slice=%u slots stress_every=%u allocations\r\n",
             (unsigned)s_triggerSlots,
-            (unsigned)s_sliceSlots);
+            (unsigned)s_sliceSlots,
+            (unsigned)s_stressEvery);
     }
 }
 
@@ -1064,8 +1125,23 @@ bool GcIncremental_FinishCycle()
 {
     NATIVE_PROFILE_CLR_CORE();
 
+    // Consumed here, so a collection nested in this one's aftermath (SpawnFinalizer allocating, in stress mode) cannot
+    // be taken for the final pause.
+    const bool ownFinalPause = s_ownFinalPause;
+    s_ownFinalPause = false;
+
     if (!s_cycleActive)
     {
+        return false;
+    }
+
+    if (!ownFinalPause)
+    {
+        // A collection requested mid-cycle (GC.Collect, an allocation failure) gets the exact stop-the-world result:
+        // the cycle's snapshot would keep everything reachable at its start or allocated since, so GC.Collect would
+        // not collect or finalize what was just dropped, and an allocation failure would not reclaim floating garbage
+        // before the allocator's single retry. The cycle never touched HB_Alive, so Mark() starts clean.
+        AbortCycle("collection requested mid-cycle; full mark instead");
         return false;
     }
 
@@ -1174,21 +1250,12 @@ void GcIncremental_OnQuantum()
         return;
     }
 
-    uint64_t start = NowNs();
-    bool done = Drain(s_sliceSlots);
-    uint64_t elapsed = NowNs() - start;
-
-    s_cycle.slices++;
-
-    if (elapsed > s_cycle.sliceMaxNs)
-    {
-        s_cycle.sliceMaxNs = elapsed;
-    }
-
-    if (done)
+    if (RunSlice())
     {
         // The final pause: a full collection, which finishes the cycle in place of Mark().
+        s_ownFinalPause = true;
         g_CLR_RT_ExecutionEngine.PerformGarbageCollection();
+        s_ownFinalPause = false;
     }
 }
 

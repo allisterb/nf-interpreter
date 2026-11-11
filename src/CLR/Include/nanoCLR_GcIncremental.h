@@ -46,7 +46,8 @@ void GcIncremental_OnMarked();
 
 // Incremental cycle. FinishCycle runs in place of Mark() in a full collection: with a cycle active it completes the
 // cycle's mark (drain, finalizer pass, transfer to HB_Alive) and returns true. It returns false, and Mark() runs, when
-// no cycle is active or the cycle lost a grey push.
+// no cycle is active, the cycle lost a grey push, or the collection is not the cycle's own final pause (GC.Collect or
+// an allocation failure mid-cycle discards the cycle for the exact stop-the-world result).
 bool GcIncremental_FinishCycle();
 // A thread quantum has ended: start a cycle, run a mark slice, or request the final pause.
 void GcIncremental_OnQuantum();

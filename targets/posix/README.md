@@ -147,8 +147,20 @@ IPv4 addresses exposed by the managed snapshot.
     objects (default 4096). This is a soft target: an object is scanned whole, except that
     reference arrays longer than 1024 elements are scanned in chunks.
   - **Finish:** when no grey work is left, a full collection runs with the cycle's mark in place of
-    the stop-the-world mark. The sweep is still stop-the-world. A collection requested mid-cycle,
-    for example on allocation failure or `GC.Collect`, finishes the cycle the same way.
+    the stop-the-world mark. The sweep is still stop-the-world.
+  - **Requested collections:** a collection requested mid-cycle, for example on allocation failure
+    or `GC.Collect`, discards the cycle and marks stop-the-world. This gives the exact result: the
+    cycle's snapshot would keep everything reachable at its start or allocated since. Such a cycle
+    shows up as `aborted: collection requested mid-cycle`. If that happens often, cycles start too
+    late or the slices are too small.
+  - **GC-stress mode:** `NANOCLR_GC_INCREMENTAL_STRESS=N` also starts a cycle or runs one slice
+    every N object allocations, from inside the allocator. This interleaves marking with native
+    code as well as with IL. The final pause still waits for the next quantum boundary. Combine it
+    with `NANOCLR_GC_VERIFY=1`.
+    - The `[GCC]` line's `slices` and `slice_max_us` include slices run from the allocator.
+    - A miss reported in this mode is not necessarily a barrier hole. It can also be an upstream
+      native that holds an object only in a C++ local across an allocation, which
+      `NANOCLR_FORCE_GC_BEFORE_EVERY_ALLOCATION` would expose too.
   - **Weak delegate lists** are traced as strong during a cycle. While cycles keep running, their
     targets are collected only by a collection that runs without a cycle.
   - **Aborts:** compaction aborts a cycle. A lost grey push (host memory exhausted) aborts it too,
