@@ -44,6 +44,7 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteCompaction()
 
     CLR_RT_ExecutionEngine::ExecutionConstraint_Suspend();
 
+    NANOCLR_GC_ON_COMPACTION()
     Heap_Compact();
     NANOCLR_GC_ON_HEAP_COMPACTED()
 

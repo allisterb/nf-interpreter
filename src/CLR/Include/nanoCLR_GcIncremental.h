@@ -44,6 +44,15 @@ void GcIncremental_OnFullMark();
 // Mark() has finished: verify mode checks its result here.
 void GcIncremental_OnMarked();
 
+// Incremental cycle. FinishCycle runs in place of Mark() in a full collection: with a cycle active it completes the
+// cycle's mark (drain, finalizer pass, transfer to HB_Alive) and returns true. It returns false, and Mark() runs, when
+// no cycle is active or the cycle lost a grey push.
+bool GcIncremental_FinishCycle();
+// A thread quantum has ended: start a cycle, run a mark slice, or request the final pause.
+void GcIncremental_OnQuantum();
+// Heap compaction is about to move objects: abort any active cycle.
+void GcIncremental_OnCompaction();
+
 #define NANOCLR_GC_PRE_WRITE(slot)                                                                                     \
     {                                                                                                                  \
         if (g_GcIncremental_BarrierActive)                                                                             \
@@ -78,6 +87,15 @@ void GcIncremental_OnMarked();
 #define NANOCLR_GC_ON_HEAP_COMPACTED()       GcIncremental_OnHeapCompacted();
 #define NANOCLR_GC_ON_FULL_MARK()            GcIncremental_OnFullMark();
 #define NANOCLR_GC_ON_MARKED()               GcIncremental_OnMarked();
+#define NANOCLR_GC_ON_QUANTUM()              GcIncremental_OnQuantum();
+#define NANOCLR_GC_ON_COMPACTION()           GcIncremental_OnCompaction();
+#define NANOCLR_GC_MARK()                                                                                              \
+    {                                                                                                                  \
+        if (!GcIncremental_FinishCycle())                                                                              \
+        {                                                                                                              \
+            Mark();                                                                                                    \
+        }                                                                                                              \
+    }
 
 #else
 
@@ -91,6 +109,9 @@ void GcIncremental_OnMarked();
 #define NANOCLR_GC_ON_HEAP_COMPACTED()
 #define NANOCLR_GC_ON_FULL_MARK()
 #define NANOCLR_GC_ON_MARKED()
+#define NANOCLR_GC_ON_QUANTUM()
+#define NANOCLR_GC_ON_COMPACTION()
+#define NANOCLR_GC_MARK() Mark();
 
 #endif // NANOCLR_GC_INCREMENTAL
 

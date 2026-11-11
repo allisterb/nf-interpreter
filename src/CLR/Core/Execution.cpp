@@ -1743,6 +1743,7 @@ HRESULT CLR_RT_ExecutionEngine::ScheduleThreads(int maxContextSwitch)
         Watchdog_Reset();
 
         PutInProperList(th);
+        NANOCLR_GC_ON_QUANTUM()
 
         (void)ProcessTimer();
     }

@@ -132,11 +132,36 @@ IPv4 addresses exposed by the managed snapshot.
 
 `NANO_POSIX_GC_INCREMENTAL`
 - Default: `OFF`
-- Experimental groundwork for an incremental, snapshot-at-the-beginning collector: a deletion write
-  barrier in the `CLR_RT_HeapBlock` setters and at raw heap copies, keep-alive shading where weak
-  pointers are read, and object-start / allocated-this-cycle bitmaps kept in host memory (one bit per
-  heap block each). No incremental cycle exists yet, so collection behaviour is unchanged. When `OFF`,
-  every hook compiles to nothing.
+- Experimental incremental, snapshot-at-the-beginning (SATB) collector. When `ON`, the build contains:
+  - a deletion write barrier in the `CLR_RT_HeapBlock` setters and at raw heap copies;
+  - keep-alive shading where weak pointers are read;
+  - object-start, allocated-this-cycle and marked bitmaps in host memory, one bit per heap block each;
+  - an incremental mark cycle, which is off unless `NANOCLR_GC_INCREMENTAL=1` is set.
+
+  When `OFF`, every hook compiles to nothing.
+- `NANOCLR_GC_INCREMENTAL=1` turns on incremental cycles.
+  - **Start:** once `NANOCLR_GC_INCREMENTAL_TRIGGER` percent of the heap (1–100, default 25) has been
+    allocated since the last collection, the next thread-quantum boundary takes the initial pause.
+    The pause snapshots the roots and turns the barrier on.
+  - **Slices:** each later quantum boundary scans about `NANOCLR_GC_INCREMENTAL_SLICE` slots of grey
+    objects (default 4096). This is a soft target: an object is scanned whole, except that
+    reference arrays longer than 1024 elements are scanned in chunks.
+  - **Finish:** when no grey work is left, a full collection runs with the cycle's mark in place of
+    the stop-the-world mark. The sweep is still stop-the-world. A collection requested mid-cycle,
+    for example on allocation failure or `GC.Collect`, finishes the cycle the same way.
+  - **Weak delegate lists** are traced as strong during a cycle. While cycles keep running, their
+    targets are collected only by a collection that runs without a cycle.
+  - **Aborts:** compaction aborts a cycle. A lost grey push (host memory exhausted) aborts it too,
+    and a stop-the-world collection runs in its place.
+  - Each finished cycle prints one line:
+
+    ```text
+    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... transfer_us=... total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=...
+    ```
+
+    - `final_mark_us` is the final pause's marking: draining what is still grey, the finalizer
+      pass, and `transfer_us`, which is the heap walk that copies the cycle's mark into `HB_Alive`.
+    - `final_scanned` counts the objects still grey at that point. It is 0 when the slices kept up.
 - `NANOCLR_GC_BARRIER_STRESS=1` in the environment turns the barrier on for the whole run. Shades are
   validated and counted but never marked, and each collection checks the object-start bitmap against
   a heap walk and prints one line:
@@ -148,9 +173,9 @@ IPv4 addresses exposed by the managed snapshot.
   Any non-zero `alloc_dirty`, `bitmap_missing`, `bitmap_stale` or `bitmap_interior` count is a bug: a
   heap path that allocates or frees without updating the bitmap. `alloc_dirty` counts allocations
   (since the last collection) whose memory still carried a bit, which allocation relies on never
-  happening. `bitmap_orphans` counts size-1 value slots standing
-  alone in the heap walk (assembly static fields, which are extracted as one run and restamped slot
-  by slot, and the tail left when `SetReflection` shrinks a two-block MethodInfo); they are expected.
+  happening. `bitmap_orphans` counts size-1 value slots standing alone in the heap walk. On posix
+  these are the field slots left behind when `SetReflection` restamps an object header to one block.
+  They are expected.
   The check walks the whole heap at the start of every collection, so do not combine stress mode
   with `NANO_POSIX_GC_TIMING` measurements.
 - `NANOCLR_GC_VERIFY=1` turns on verify mode, which checks each mark against a second
@@ -167,14 +192,16 @@ IPv4 addresses exposed by the managed snapshot.
   [GCV] run=12 objects=... marked=... injected=0 misses=0 dropped_dead=0 floating=...
   ```
 
-  - Until the incremental marker exists, the mark under test is the stop-the-world mark itself, so
-    `misses` must be 0.
-  - `floating` counts blocks that were already `HB_Alive` before `Mark()` ran (created since the
-    previous collection) but are unreachable.
+  - After an incremental cycle, the mark under test is the cycle's. Otherwise it is the
+    stop-the-world mark itself. `misses` must be 0 either way.
+  - Without a cycle, `floating` counts unreachable blocks that were already `HB_Alive` before
+    `Mark()` ran (created since the previous collection).
     - In practice these are size-1 slots that stand alone in the heap, for example field slots left
       behind when `SetReflection` restamps an object header to one block.
     - The union keeps them for one more collection, the same lifetime as with verify off.
-    - Once the incremental marker exists, `floating` will also include genuine floating garbage.
+  - After a cycle, `floating` is the cycle's floating garbage: objects unreachable by the end of the
+    cycle that it marked anyway. These include objects allocated during the cycle and the targets of
+    weak delegate lists.
   - `NANOCLR_GC_VERIFY_INJECT=N` drops every Nth marked object from the snapshot, which tests the
     detector.
     - A dropped object that is still reachable must come back as a miss.
