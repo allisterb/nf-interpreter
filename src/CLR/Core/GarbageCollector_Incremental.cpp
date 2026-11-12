@@ -230,34 +230,6 @@ void ClearBits(CLR_UINT32 *bits, size_t first, size_t count)
     bits[lastWord] &= ~tail;
 }
 
-void SetBits(CLR_UINT32 *bits, size_t first, size_t count)
-{
-    if (count == 0)
-    {
-        return;
-    }
-
-    const size_t last = first + count - 1;
-    size_t w = first / c_bitsPerWord;
-    const size_t lastWord = last / c_bitsPerWord;
-    const CLR_UINT32 tail = ~(MaskFrom(last % c_bitsPerWord) << 1);
-
-    if (w == lastWord)
-    {
-        bits[w] |= MaskFrom(first % c_bitsPerWord) & tail;
-        return;
-    }
-
-    bits[w++] |= MaskFrom(first % c_bitsPerWord);
-
-    for (; w < lastWord; w++)
-    {
-        bits[w] = ~0u;
-    }
-
-    bits[lastWord] |= tail;
-}
-
 // Bits of word w that cover slots [first, end).
 CLR_UINT32 RangeMask(size_t w, size_t first, size_t end)
 {
@@ -1203,17 +1175,40 @@ bool SelfCheckFailed(const char *why, size_t slot)
     return false;
 }
 
+// Where a "dead start without an end" begins: a borrow left at the cluster end means the dead starts D exceed the ends
+// E as one big number, so the open object starts at the highest slot where D and E differ (above it they agree, and a
+// closed size-1 dead object has both bits). Returns end - 1 if they never differ. Kept out of ComputeFreeMask's loop,
+// where tracking it per word cost a data-dependent branch.
+size_t OpenDeadStart(size_t first, size_t end)
+{
+    for (size_t w = (end - 1) / c_bitsPerWord + 1; w-- > first / c_bitsPerWord;)
+    {
+        const CLR_UINT32 differ = ((s_starts[w] & ~s_marked[w]) ^ s_ends[w]) & RangeMask(w, first, end);
+
+        if (differ != 0)
+        {
+            return w * c_bitsPerWord + 31 - (size_t)__builtin_clz(differ);
+        }
+    }
+
+    return end - 1;
+}
+
 // Pass 1 for the cluster payload [first, end), touching no heap memory: the free mask is every slot outside all blocks
 // (coverage from the toggles at block starts, S|V, and after block ends, E) plus every dead object's extent (S without
-// a live bit, up to its E). Returns false if the bitmaps contradict themselves: a kept start outside coverage or inside
-// a dead extent, a dead start without an end, or a block left open at the cluster end.
+// a live bit, up to the first E at or after it). Returns false if the bitmaps contradict themselves: a kept start
+// outside coverage or inside a dead extent, a dead start without an end, or a block left open at the cluster end.
 //
-// That is a parity check per gap between kept starts, so it catches an odd number of start/end errors in a gap, which
-// is what one missing or stale bit gives. It cannot catch errors that cancel in pairs (two stale ends inside one live
-// block, an event block missing both its start and its end), nor bitmaps that agree with each other but not with the
-// headers (a block resized or turned into an event block without a hook). Those rely on every boundary change being
-// hooked; barrier stress mode compares each bitmap sweep with the header walk (ShadowCheck) and VerifyStarts checks the
-// bitmaps against the headers at every collection under barrier stress.
+// One pass over the words. The dead extents come from a subtraction: E minus the dead starts borrows from each dead
+// start up to the first end at or after it, so the bits that change, (E - D) ^ E, are exactly the extents, ends
+// included. A dead object still open at a word's last slot leaves a borrow, which carries into the next word's slot 0.
+//
+// The checks are a parity check per gap between kept starts, so they catch an odd number of start/end errors in a gap,
+// which is what one missing or stale bit gives. They cannot catch errors that cancel in pairs (two stale ends inside
+// one live block, an event block missing both its start and its end), nor bitmaps that agree with each other but not
+// with the headers (a block resized or turned into an event block without a hook). Those rely on every boundary change
+// being hooked; barrier stress mode compares each bitmap sweep with the header walk (ShadowCheck) and VerifyStarts
+// checks the bitmaps against the headers at every collection under barrier stress.
 bool ComputeFreeMask(size_t first, size_t end, CLR_UINT32 &deadObjects)
 {
     if (end - first > CLR_RT_HeapBlock::HB_MaxSize)
@@ -1221,33 +1216,33 @@ bool ComputeFreeMask(size_t first, size_t end, CLR_UINT32 &deadObjects)
         return SelfCheckFailed("cluster larger than a block header can describe", first);
     }
 
-    auto deadStarts = [](size_t w) { return s_starts[w] & ~s_marked[w]; };
-    auto ends = [](size_t w) { return s_ends[w]; };
-
-    for (size_t s = NextSet(first, end, deadStarts); s < end;)
-    {
-        const size_t e = NextSet(s, end, ends);
-
-        if (e == end)
-        {
-            return SelfCheckFailed("dead start without an end", s);
-        }
-
-        SetBits(s_allocated, s, e - s + 1);
-        deadObjects++;
-        s = NextSet(e + 1, end, deadStarts);
-    }
-
     CLR_UINT32 covered = 0;  // coverage at the previous word's last slot
     CLR_UINT32 endCarry = 0; // an end bit on the previous word's last slot toggles this word's slot 0
+    CLR_UINT32 borrow = 0;   // a dead object is open at the previous word's last slot
 
     for (size_t w = first / c_bitsPerWord, last = (end - 1) / c_bitsPerWord; w <= last; w++)
     {
         const CLR_UINT32 mask = RangeMask(w, first, end);
         const CLR_UINT32 starts = (s_starts[w] | s_events[w]) & mask;
         const CLR_UINT32 blockEnds = s_ends[w] & mask;
+
+        if ((starts | blockEnds | endCarry) == 0 && w != last)
+        {
+            // No block boundary in this word: it lies inside one block or in a free area, and all three carries pass
+            // through unchanged. The free mask is the whole word unless it is inside a kept block.
+            if (borrow != 0 && covered == 0)
+            {
+                return SelfCheckFailed("dead extent outside coverage", w * c_bitsPerWord + (size_t)__builtin_ctz(mask));
+            }
+
+            s_allocated[w] = (s_allocated[w] & ~mask) | (covered != 0 && borrow == 0 ? 0u : mask);
+            continue;
+        }
+
+        const CLR_UINT32 deadStarts = s_starts[w] & ~s_marked[w] & mask;
         const CLR_UINT32 cover = PrefixXor(starts ^ (blockEnds << 1) ^ endCarry) ^ (covered ? ~0u : 0u);
-        const CLR_UINT32 dead = s_allocated[w] & mask;
+        const uint64_t borrowed = (uint64_t)blockEnds - deadStarts - borrow;
+        const CLR_UINT32 dead = ((CLR_UINT32)borrowed ^ blockEnds) & mask;
         const CLR_UINT32 kept = ((s_starts[w] & s_marked[w]) | s_events[w]) & mask;
 
         const size_t base = w * c_bitsPerWord;
@@ -1269,12 +1264,19 @@ bool ComputeFreeMask(size_t first, size_t end, CLR_UINT32 &deadObjects)
 
         covered = cover >> 31;
         endCarry = blockEnds >> 31;
+        borrow = (CLR_UINT32)(borrowed >> 63);
+        deadObjects += (CLR_UINT32)__builtin_popcount(deadStarts);
         s_allocated[w] = (s_allocated[w] & ~mask) | ((~cover | dead) & mask);
 
         if (w == last)
         {
-            // Coverage just past the cluster end must be closed.
+            // Coverage just past the cluster end must be closed, and no dead object may still be open.
             const size_t endBit = end - w * c_bitsPerWord;
+
+            if (borrow != 0)
+            {
+                return SelfCheckFailed("dead start without an end", OpenDeadStart(first, end));
+            }
 
             if ((endBit < c_bitsPerWord ? (cover >> endBit) & 1 : covered ^ endCarry) != 0)
             {
