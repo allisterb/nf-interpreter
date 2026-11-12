@@ -84,7 +84,7 @@ void GcIncremental_OnMarked();
 // Sweep() is about to rebuild the free lists: from here to OnSwept, every free run is counted. After an incremental
 // cycle it rebuilds them from the bitmaps alone and returns true; it returns false when the cluster walks must run.
 bool GcIncremental_OnSweepHeap();
-// Sweep() has finished: an incremental cycle's live bitmap is retired here.
+// Sweep() has finished: an incremental cycle's live bitmap is retired here, and its "[GCC]" line kept for OnQuantum.
 void GcIncremental_OnSwept();
 // In place of Heap_ComputeAliveVsDeadRatio() after a sweep: sets m_totalBytes and m_freeBytes from the free runs the
 // sweep counted, instead of walking every free-list node. Returns false (the caller walks) if no count is available.
@@ -95,7 +95,8 @@ bool GcIncremental_ApplySweptFree();
 // Mark() runs, when no cycle is active, the cycle lost a grey push, or the collection is not the cycle's own final
 // pause (GC.Collect or an allocation failure mid-cycle discards the cycle for the exact stop-the-world result).
 bool GcIncremental_FinishCycle();
-// A thread quantum has ended: start a cycle, run a mark slice, or request the final pause.
+// A thread quantum has ended: print the last cycle's pending "[GCC]" line, then start a cycle, run a mark slice, or
+// request the final pause.
 void GcIncremental_OnQuantum();
 // Heap compaction is about to move objects: abort any active cycle.
 void GcIncremental_OnCompaction();

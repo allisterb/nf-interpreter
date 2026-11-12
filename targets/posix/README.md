@@ -190,10 +190,18 @@ IPv4 addresses exposed by the managed snapshot.
     targets are collected only by a collection that runs without a cycle.
   - **Aborts:** compaction aborts a cycle. A lost grey push (host memory exhausted) aborts it too,
     and a stop-the-world collection runs in its place.
-  - Each finished cycle prints one line:
+  - With `NANOCLR_GC_INCREMENTAL_STATS=1`, each finished cycle prints one line. It is printed at the
+    next quantum boundary rather than in the final pause, because a write to stdout is a message to
+    the filesystem manager on QNX and cost about 60 µs of every pause. The running thread still pays
+    that cost at the quantum boundary, so leave stats off where latency matters.
+    - The line waits while every thread is blocked, and is lost if the program ends before another
+      quantum. A soft reboot prints it first.
+    - The startup line `[GCC] incremental on: ...` shows `stats=1`.
+    - `[GCC] cycle=N aborted: ...` lines print whatever the setting, inside the collection that
+      aborts the cycle. That collection is a stop-the-world one, which costs far more than the print.
 
     ```text
-    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=...
+    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=...
     ```
 
     - `final_mark_us` is the final pause's marking: draining what is still grey, the finalizer
@@ -201,6 +209,15 @@ IPv4 addresses exposed by the managed snapshot.
     - `sweep_us` is the rest of the final pause: weak references and the sweep, which reads
       liveness from the live bitmap rather than from a heap walk that copies it into `HB_Alive`.
       With `NANOCLR_GC_VERIFY=1` it includes verify mode's second mark.
+    - `sweep_us` splits into `pre_us` (verify mode's second mark, weak references and
+      `RecoverEventsFromGC`), `heap_us` (the heap sweep) and `post_us` (clearing the cycle's
+      bitmaps). For a bitmap sweep, `heap_us` splits further into `clear_us` (the scratch bitmap),
+      `mask_us` (the free mask and its self-check, plus the shadow check under barrier stress) and
+      `apply_us` (clearing the freed slots' start, event and end bits in one pass over the bitmaps,
+      then writing the free runs, plus the `[GCS]` line under barrier stress), with the
+      `free_runs` written and `dead_objects` freed. `clear_us`, `mask_us`, `apply_us`, `free_runs`
+      and `dead_objects` are 0 after a header walk. Each part is truncated to whole microseconds on
+      its own, so the parts can add up to a microsecond or two less than the whole.
     - `total_ms` runs from the initial pause to the end of the sweep.
     - `bitmap_sweep` is 1 when the bitmap sweep ran and 0 when the header walk did.
     - `final_scanned` counts the objects still grey at that point. It is 0 when the slices kept up.
