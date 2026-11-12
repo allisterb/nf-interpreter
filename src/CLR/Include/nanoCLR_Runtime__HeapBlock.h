@@ -925,6 +925,13 @@ struct CLR_RT_HeapBlock
     }
     void MarkAlive()
     {
+#if defined(NANOCLR_GC_INCREMENTAL)
+        // While a cycle's live bitmap is published, an object is marked there: the bitmap sweep reads no headers.
+        if (g_GcIncremental_LiveBits != nullptr && GcIncremental_SetLive(this))
+        {
+            return;
+        }
+#endif
         SetFlags(HB_Alive);
     }
 

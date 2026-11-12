@@ -135,8 +135,13 @@ IPv4 addresses exposed by the managed snapshot.
 - Experimental incremental, snapshot-at-the-beginning (SATB) collector. When `ON`, the build contains:
   - a deletion write barrier in the `CLR_RT_HeapBlock` setters and at raw heap copies;
   - keep-alive shading where weak pointers are read;
-  - object-start, allocated-this-cycle and marked bitmaps in host memory, one bit per heap block each;
-  - an incremental mark cycle, which is off unless `NANOCLR_GC_INCREMENTAL=1` is set.
+  - object-start, event-start, block-end, allocated-this-cycle and marked bitmaps in host memory,
+    one bit per heap block each;
+  - an incremental mark cycle, which is off unless `NANOCLR_GC_INCREMENTAL=1` is set;
+  - free-memory accounting during the sweep. Every collection takes its free-byte count from the
+    free runs the sweep rebuilds the free lists from, instead of walking every free-list node
+    afterwards. Barrier stress and verify modes also do the walk and print
+    `[GCI] free count mismatch ...` if the two differ.
 
   When `OFF`, every hook compiles to nothing.
 - `NANOCLR_GC_INCREMENTAL=1` turns on incremental cycles.
@@ -148,6 +153,26 @@ IPv4 addresses exposed by the managed snapshot.
     reference arrays longer than 1024 elements are scanned in chunks.
   - **Finish:** when no grey work is left, a full collection runs with the cycle's mark in place of
     the stop-the-world mark. The sweep is still stop-the-world.
+  - **Bitmap sweep:** that collection rebuilds the free lists from the bitmaps instead of walking
+    every block header. The bitmaps hold object starts, event-block starts and block ends, and the
+    collection writes only the first header of each free run.
+    - It checks the bitmaps against themselves first and falls back to the header walk if they
+      disagree, printing `[GCS] self-check: ...`.
+    - `NANOCLR_GC_INCREMENTAL_HEADER_SWEEP=1` always uses the header walk.
+    - Collections without a cycle, and cycles under verify mode, always use the header walk.
+    - Blocks alive only through a stale `HB_Alive`, such as the slots `SetReflection` cuts off an
+      object, are freed one collection earlier than by the header walk.
+    - With `NANOCLR_GC_BARRIER_STRESS=1`, every bitmap sweep is first compared with what the header
+      walk would free. Any disagreement other than such blocks is printed and the header walk runs
+      instead. Each collection then prints:
+
+      ```text
+      [GCS] run=12 runs=... free_blocks=... dead_objects=... strays_freed=... orphans_kept=0 alive_kept=0
+      ```
+
+      `orphans_kept` and `alive_kept` should be 0. `orphans_kept` counts slots cut off an object by a
+      truncation the bitmaps missed. `alive_kept` counts kept non-event blocks still carrying
+      `HB_Alive`, which no bitmap sweep clears.
   - **Requested collections:** a collection requested mid-cycle, for example on allocation failure
     or `GC.Collect`, discards the cycle and marks stop-the-world. This gives the exact result: the
     cycle's snapshot would keep everything reachable at its start or allocated since. Such a cycle
@@ -168,7 +193,7 @@ IPv4 addresses exposed by the managed snapshot.
   - Each finished cycle prints one line:
 
     ```text
-    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=...
+    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=...
     ```
 
     - `final_mark_us` is the final pause's marking: draining what is still grey, the finalizer
@@ -177,17 +202,20 @@ IPv4 addresses exposed by the managed snapshot.
       liveness from the live bitmap rather than from a heap walk that copies it into `HB_Alive`.
       With `NANOCLR_GC_VERIFY=1` it includes verify mode's second mark.
     - `total_ms` runs from the initial pause to the end of the sweep.
+    - `bitmap_sweep` is 1 when the bitmap sweep ran and 0 when the header walk did.
     - `final_scanned` counts the objects still grey at that point. It is 0 when the slices kept up.
 - `NANOCLR_GC_BARRIER_STRESS=1` in the environment turns the barrier on for the whole run. Shades are
   validated and counted but never marked, and each collection checks the object-start bitmap against
   a heap walk and prints one line:
 
   ```text
-  [GCI] full-mark run=12 prewrite=... shade_bytes=... weak=... pushed=... black=... rejected=... grey_dropped=... alloc_dirty=0 bitmap_missing=0 bitmap_stale=0 bitmap_interior=0
+  [GCI] full-mark run=12 prewrite=... shade_bytes=... weak=... pushed=... black=... rejected=... grey_dropped=... alloc_dirty=0 bitmap_missing=0 bitmap_orphans=... bitmap_stale=0 bitmap_interior=0 bitmap_blocks=0
   ```
 
-  Any non-zero `alloc_dirty`, `bitmap_missing`, `bitmap_stale` or `bitmap_interior` count is a bug: a
-  heap path that allocates or frees without updating the bitmap. `alloc_dirty` counts allocations
+  Any non-zero `alloc_dirty`, `bitmap_missing`, `bitmap_stale`, `bitmap_interior` or
+  `bitmap_blocks` count is a bug: a heap path that allocates, frees or reshapes a block without
+  updating the bitmaps. `bitmap_blocks` counts blocks whose event-start and end bits disagree with
+  their header. `alloc_dirty` counts allocations
   (since the last collection) whose memory still carried a bit, which allocation relies on never
   happening. `bitmap_orphans` counts size-1 value slots standing alone in the heap walk. On posix
   these are the field slots left behind when `SetReflection` restamps an object header to one block.

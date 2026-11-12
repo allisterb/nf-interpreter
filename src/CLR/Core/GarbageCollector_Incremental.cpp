@@ -43,7 +43,8 @@
 // A collection requested mid-cycle (GC.Collect, an allocation failure) discards the cycle and runs Mark(), for the
 // exact result. Weak delegate lists are traced as strong during a cycle, so while cycles keep running their targets are
 // collected only by a collection that runs without one. Compaction aborts a cycle, as does a lost grey push (the final
-// pause then runs Mark()). Each finished cycle prints one "[GCC]" line after its sweep. GC-stress mode
+// pause then runs Mark()). A finished cycle's sweep rebuilds the free lists from the bitmaps (SweepFromBitmaps) unless
+// they fail their self-check. Each finished cycle prints one "[GCC]" line after its sweep. GC-stress mode
 // (NANOCLR_GC_INCREMENTAL_STRESS=N) also starts a cycle or runs a slice every N object allocations, from inside the
 // allocator, so marking interleaves with native code as well as with IL.
 
@@ -99,6 +100,16 @@ const size_t c_stressGreyCap = 65536;
 const size_t c_arrayChunk = 1024;              // reference arrays longer than this are scanned across slices
 const CLR_UINT32 c_verifyReportedMisses = 5;   // misses printed in detail per collection
 const CLR_UINT32 c_verifyReportedFloating = 3; // floating objects printed in detail per collection
+const CLR_UINT32 c_sweepReportedErrors = 5;    // bitmap-sweep disagreements printed in detail per collection
+
+// The bitmap sweep writes free-run headers only, so it is built only when no heap debugging needs every dead block
+// visited (CLR_RT_HeapCluster::RecoverFromGC: early-collection tracing, allocation profiling, heap validation).
+#if NANOCLR_VALIDATE_HEAP == NANOCLR_VALIDATE_HEAP_0_None && !defined(NANOCLR_PROFILE_NEW_ALLOCATIONS) &&              \
+    !defined(NANOCLR_TRACE_EARLYCOLLECTION)
+const bool c_bitmapSweepBuilt = true;
+#else
+const bool c_bitmapSweepBuilt = false;
+#endif
 
 bool s_valid;
 bool s_stress;
@@ -115,6 +126,8 @@ uintptr_t s_base; // address of slot 0: the first cluster's payload start
 uintptr_t s_end;
 size_t s_slots;
 CLR_UINT32 *s_starts;    // object-start bitmap
+CLR_UINT32 *s_events;    // event-block-start bitmap
+CLR_UINT32 *s_ends;      // last slot of every object and event block
 CLR_UINT32 *s_allocated; // allocated-this-cycle bitmap
 CLR_UINT32 *s_marked;    // incremental cycle: shaded (grey or black) objects and marked root slots; from the final
                          // pause to the sweep, the live bitmap (marked | allocated)
@@ -130,6 +143,12 @@ bool s_cycleActive;        // between the initial and the final pause
 bool s_greyOverflow;       // a grey push was lost during the cycle: the final pause falls back to Mark()
 bool s_ownFinalPause;      // the collection running is the final pause OnQuantum requested (grey stack empty)
 bool s_sweepPending;       // a finished cycle's live bitmap is published until the sweep is done (OnSwept)
+bool s_countingFree;       // between OnSweepHeap and OnSwept: OnFree adds each free run to s_sweptFreeBlocks
+bool s_sweptFreeReady;     // s_sweptFreeBlocks holds a complete sweep's count, not yet applied
+size_t s_sweptFreeBlocks;  // blocks in the free runs the sweep rebuilt the free lists from
+bool s_headerSweep;        // NANOCLR_GC_INCREMENTAL_HEADER_SWEEP=1: never sweep from the bitmaps
+bool s_bitmapSweepVeto;    // MarkAlive() hit a block that is not an object start while the bitmap was published
+bool s_bitmapSwept;        // the last cycle's free lists were rebuilt from the bitmaps
 size_t s_triggerSlots;     // start a cycle once this many slots were allocated since the last collection
 size_t s_sliceSlots;       // marking budget per quantum, in slots scanned
 size_t s_allocatedSinceGc; // object slots allocated since the last collection
@@ -189,6 +208,72 @@ void ClearBits(CLR_UINT32 *bits, size_t first, size_t count)
     }
 
     bits[lastWord] &= ~tail;
+}
+
+void SetBits(CLR_UINT32 *bits, size_t first, size_t count)
+{
+    if (count == 0)
+    {
+        return;
+    }
+
+    const size_t last = first + count - 1;
+    size_t w = first / c_bitsPerWord;
+    const size_t lastWord = last / c_bitsPerWord;
+    const CLR_UINT32 tail = ~(MaskFrom(last % c_bitsPerWord) << 1);
+
+    if (w == lastWord)
+    {
+        bits[w] |= MaskFrom(first % c_bitsPerWord) & tail;
+        return;
+    }
+
+    bits[w++] |= MaskFrom(first % c_bitsPerWord);
+
+    for (; w < lastWord; w++)
+    {
+        bits[w] = ~0u;
+    }
+
+    bits[lastWord] |= tail;
+}
+
+// Bits of word w that cover slots [first, end).
+CLR_UINT32 RangeMask(size_t w, size_t first, size_t end)
+{
+    const size_t base = w * c_bitsPerWord;
+    const CLR_UINT32 low = base < first ? MaskFrom(first - base) : ~0u;
+    const CLR_UINT32 high = end - base < c_bitsPerWord ? ~MaskFrom(end - base) : ~0u;
+
+    return low & high;
+}
+
+// First slot in [from, end) whose bit is set in word(w), or end. word(w) may return bits outside the range.
+template <typename F> size_t NextSet(size_t from, size_t end, F word)
+{
+    for (size_t w = from / c_bitsPerWord; from < end; w++, from = w * c_bitsPerWord)
+    {
+        const CLR_UINT32 bits = word(w) & RangeMask(w, from, end);
+
+        if (bits != 0)
+        {
+            return w * c_bitsPerWord + (size_t)__builtin_ctz(bits);
+        }
+    }
+
+    return end;
+}
+
+// Coverage from toggles: bit i of the result is the XOR of bits 0..i of x.
+CLR_UINT32 PrefixXor(CLR_UINT32 x)
+{
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+
+    return x;
 }
 
 size_t BitmapWords()
@@ -681,9 +766,12 @@ void StressStep()
     }
 }
 
+// Rebuilds the block bitmaps from a heap walk (heap initialisation, compaction) and clears the cycle bitmaps.
 void RebuildStarts()
 {
     memset(s_starts, 0, BitmapWords() * sizeof(*s_starts));
+    memset(s_events, 0, BitmapWords() * sizeof(*s_events));
+    memset(s_ends, 0, BitmapWords() * sizeof(*s_ends));
     memset(s_allocated, 0, BitmapWords() * sizeof(*s_allocated));
     memset(s_marked, 0, BitmapWords() * sizeof(*s_marked));
 
@@ -691,9 +779,22 @@ void RebuildStarts()
     {
         for (CLR_RT_HeapBlock_Node *ptr = hc->m_payloadStart; ptr < hc->m_payloadEnd; ptr += ptr->DataSize())
         {
-            if (IsObjectBlock(ptr))
+            const size_t i = (size_t)SlotIndex(ptr);
+
+            if (ptr->DataType() == DATATYPE_FREEBLOCK)
             {
-                SetBit(s_starts, (size_t)SlotIndex(ptr));
+                continue;
+            }
+
+            SetBit(s_ends, i + ptr->DataSize() - 1);
+
+            if (ptr->IsEvent())
+            {
+                SetBit(s_events, i);
+            }
+            else if (IsObjectBlock(ptr))
+            {
+                SetBit(s_starts, i);
             }
         }
     }
@@ -710,10 +811,43 @@ bool IsOrphanSlot(const CLR_RT_HeapBlock *block)
            (dt < DATATYPE_STRING || dt == DATATYPE_OBJECT || dt == DATATYPE_BYREF || dt == DATATYPE_ARRAY_BYREF);
 }
 
-// Stress mode: compares the object-start bitmap with a heap walk.
-void VerifyStarts(CLR_UINT32 &missing, CLR_UINT32 &orphans, CLR_UINT32 &stale, CLR_UINT32 &interior)
+// Stress mode: checks one block's event-start and end bits against its header. A free block carries no bits; a block
+// with a start bit (object or event) carries its end bit on its last slot and no other end or event bit; an event
+// block carries the event start; a block without a start (an orphan slot cut off by a truncation) carries none.
+bool BlockBitsMatch(const CLR_RT_HeapBlock_Node *ptr, size_t i)
 {
-    missing = orphans = stale = interior = 0;
+    const size_t last = i + ptr->DataSize() - 1;
+    const bool isFree = ptr->DataType() == DATATYPE_FREEBLOCK;
+    const bool started = TestBit(s_starts, i) || TestBit(s_events, i);
+
+    if (ptr->IsEvent() != TestBit(s_events, i) && !isFree)
+    {
+        return false;
+    }
+
+    for (size_t j = i; j <= last; j++)
+    {
+        const bool endExpected = started && !isFree && j == last;
+
+        if (TestBit(s_ends, j) != endExpected || (j > i && TestBit(s_events, j)) ||
+            (isFree && (TestBit(s_events, j) || TestBit(s_starts, j))))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// Stress mode: compares the object-start, event-start and end bitmaps with a heap walk.
+void VerifyStarts(
+    CLR_UINT32 &missing,
+    CLR_UINT32 &orphans,
+    CLR_UINT32 &stale,
+    CLR_UINT32 &interior,
+    CLR_UINT32 &blockBits)
+{
+    missing = orphans = stale = interior = blockBits = 0;
 
     NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
     {
@@ -749,6 +883,18 @@ void VerifyStarts(CLR_UINT32 &missing, CLR_UINT32 &orphans, CLR_UINT32 &stale, C
                 {
                     interior++;
                 }
+            }
+
+            if (!BlockBitsMatch(ptr, i) && blockBits++ < 5)
+            {
+                CLR_Debug::Printf(
+                    "[GCI] block bits: slot=%u type=0x%02x flags=0x%02x size=%u S=%u V=%u\r\n",
+                    (unsigned)i,
+                    (unsigned)ptr->DataType(),
+                    (unsigned)ptr->DataFlags(),
+                    (unsigned)ptr->DataSize(),
+                    (unsigned)TestBit(s_starts, i),
+                    (unsigned)TestBit(s_events, i));
             }
         }
     }
@@ -952,6 +1098,321 @@ void VerifyMark()
         (unsigned)stray);
 }
 
+// Bitmap sweep (task 0002, "After GO: bitmap-only sweep"): the free lists rebuilt from the bitmaps, after an
+// incremental cycle, writing only the header of each free run. s_allocated was merged into the live bitmap (s_marked)
+// by the final pause, so it holds the free mask meanwhile.
+
+// Prints why the bitmap sweep's self-check failed, with the blocks the header walk finds around slot (each as
+// slot:type/flags/size, its S and V bits, the E bit on its last slot and the E bits inside it).
+bool SelfCheckFailed(const char *why, size_t slot)
+{
+    CLR_Debug::Printf("[GCS] self-check: %s at slot=%u", why, (unsigned)slot);
+
+    NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
+    {
+        for (CLR_RT_HeapBlock_Node *ptr = hc->m_payloadStart; ptr < hc->m_payloadEnd; ptr += ptr->DataSize())
+        {
+            const size_t i = (size_t)SlotIndex(ptr);
+
+            if (i + 24 >= slot && i <= slot + 4)
+            {
+                size_t innerEnds = 0;
+
+                for (size_t j = i; j + 1 < i + ptr->DataSize(); j++)
+                {
+                    innerEnds += TestBit(s_ends, j);
+                }
+
+                CLR_Debug::Printf(
+                    " | %u:t%02x/f%02x/n%u S%u V%u E%u i%u",
+                    (unsigned)i,
+                    (unsigned)ptr->DataType(),
+                    (unsigned)ptr->DataFlags(),
+                    (unsigned)ptr->DataSize(),
+                    (unsigned)TestBit(s_starts, i),
+                    (unsigned)TestBit(s_events, i),
+                    (unsigned)TestBit(s_ends, i + ptr->DataSize() - 1),
+                    (unsigned)innerEnds);
+            }
+        }
+    }
+    NANOCLR_FOREACH_NODE_END();
+
+    CLR_Debug::Printf("\r\n");
+
+    return false;
+}
+
+// Pass 1 for the cluster payload [first, end), touching no heap memory: the free mask is every slot outside all blocks
+// (coverage from the toggles at block starts, S|V, and after block ends, E) plus every dead object's extent (S without
+// a live bit, up to its E). Returns false if the bitmaps contradict themselves: a kept start outside coverage or inside
+// a dead extent, a dead start without an end, or a block left open at the cluster end.
+//
+// That is a parity check per gap between kept starts, so it catches an odd number of start/end errors in a gap, which
+// is what one missing or stale bit gives. It cannot catch errors that cancel in pairs (two stale ends inside one live
+// block, an event block missing both its start and its end), nor bitmaps that agree with each other but not with the
+// headers (a block resized or turned into an event block without a hook). Those rely on every boundary change being
+// hooked; barrier stress mode compares each bitmap sweep with the header walk (ShadowCheck) and VerifyStarts checks the
+// bitmaps against the headers at every collection under barrier stress.
+bool ComputeFreeMask(size_t first, size_t end, CLR_UINT32 &deadObjects)
+{
+    if (end - first > CLR_RT_HeapBlock::HB_MaxSize)
+    {
+        return SelfCheckFailed("cluster larger than a block header can describe", first);
+    }
+
+    auto deadStarts = [](size_t w) { return s_starts[w] & ~s_marked[w]; };
+    auto ends = [](size_t w) { return s_ends[w]; };
+
+    for (size_t s = NextSet(first, end, deadStarts); s < end;)
+    {
+        const size_t e = NextSet(s, end, ends);
+
+        if (e == end)
+        {
+            return SelfCheckFailed("dead start without an end", s);
+        }
+
+        SetBits(s_allocated, s, e - s + 1);
+        deadObjects++;
+        s = NextSet(e + 1, end, deadStarts);
+    }
+
+    CLR_UINT32 covered = 0;  // coverage at the previous word's last slot
+    CLR_UINT32 endCarry = 0; // an end bit on the previous word's last slot toggles this word's slot 0
+
+    for (size_t w = first / c_bitsPerWord, last = (end - 1) / c_bitsPerWord; w <= last; w++)
+    {
+        const CLR_UINT32 mask = RangeMask(w, first, end);
+        const CLR_UINT32 starts = (s_starts[w] | s_events[w]) & mask;
+        const CLR_UINT32 blockEnds = s_ends[w] & mask;
+        const CLR_UINT32 cover = PrefixXor(starts ^ (blockEnds << 1) ^ endCarry) ^ (covered ? ~0u : 0u);
+        const CLR_UINT32 dead = s_allocated[w] & mask;
+        const CLR_UINT32 kept = ((s_starts[w] & s_marked[w]) | s_events[w]) & mask;
+
+        const size_t base = w * c_bitsPerWord;
+
+        if ((kept & ~cover) != 0)
+        {
+            return SelfCheckFailed("kept start outside coverage", base + (size_t)__builtin_ctz(kept & ~cover));
+        }
+
+        if ((kept & dead) != 0)
+        {
+            return SelfCheckFailed("kept start inside a dead extent", base + (size_t)__builtin_ctz(kept & dead));
+        }
+
+        if ((dead & ~cover) != 0)
+        {
+            return SelfCheckFailed("dead extent outside coverage", base + (size_t)__builtin_ctz(dead & ~cover));
+        }
+
+        covered = cover >> 31;
+        endCarry = blockEnds >> 31;
+        s_allocated[w] = (s_allocated[w] & ~mask) | ((~cover | dead) & mask);
+
+        if (w == last)
+        {
+            // Coverage just past the cluster end must be closed.
+            const size_t endBit = end - w * c_bitsPerWord;
+
+            if ((endBit < c_bitsPerWord ? (cover >> endBit) & 1 : covered ^ endCarry) != 0)
+            {
+                return SelfCheckFailed("block open at the cluster end", end - 1);
+            }
+        }
+    }
+
+    return true;
+}
+
+// Stress mode: compares the free mask with what CLR_RT_HeapCluster::RecoverFromGC would free, block by block. Expected
+// differences: a stray (a block alive only through HB_Alive, without a live bit, which the bitmap sweep frees a
+// collection earlier), and an orphan slot the bitmap sweep keeps because it lies inside a live object's extent, which
+// happens only when a truncation missed NANOCLR_GC_ON_RESIZE. Also counts kept non-event blocks still carrying
+// HB_Alive, which no bitmap sweep clears. Returns the other disagreements, printing the first few.
+CLR_UINT32 ShadowCheck(
+    CLR_RT_HeapCluster *hc,
+    CLR_UINT32 &strays,
+    CLR_UINT32 &orphans,
+    CLR_UINT32 &aliveKept,
+    CLR_UINT32 reported)
+{
+    CLR_UINT32 errors = 0;
+    auto freeBits = [](size_t w) { return s_allocated[w]; };
+    auto keptBits = [](size_t w) { return ~s_allocated[w]; };
+
+    for (CLR_RT_HeapBlock_Node *ptr = hc->m_payloadStart; ptr < hc->m_payloadEnd; ptr += ptr->DataSize())
+    {
+        const size_t i = (size_t)SlotIndex(ptr);
+        const size_t end = i + ptr->DataSize();
+        const bool allFree = NextSet(i, end, keptBits) == end;
+        const bool noneFree = NextSet(i, end, freeBits) == end;
+        const bool headerDead = !ptr->IsAlive();
+        const char *kind = nullptr;
+
+        if (noneFree && !ptr->IsEvent() && (ptr->DataFlags() & CLR_RT_HeapBlock::HB_Alive) != 0)
+        {
+            aliveKept++;
+        }
+
+        if (!allFree && !noneFree)
+        {
+            kind = "split";
+        }
+        else if (headerDead && noneFree)
+        {
+            if (IsObjectBlock(ptr) && !TestBit(s_starts, i))
+            {
+                orphans++;
+            }
+            else
+            {
+                kind = "kept-dead";
+            }
+        }
+        else if (!headerDead && allFree)
+        {
+            if (!ptr->IsEvent() && !(TestBit(s_starts, i) && TestBit(s_marked, i)))
+            {
+                if (strays++ == 0)
+                {
+                    CLR_Debug::Printf(
+                        "[GCS] first stray: slot=%u type=0x%02x flags=0x%02x size=%u S=%u\r\n",
+                        (unsigned)i,
+                        (unsigned)ptr->DataType(),
+                        (unsigned)ptr->DataFlags(),
+                        (unsigned)ptr->DataSize(),
+                        (unsigned)TestBit(s_starts, i));
+                }
+            }
+            else
+            {
+                kind = "freed-live";
+            }
+        }
+
+        if (kind != nullptr && reported + errors++ < c_sweepReportedErrors)
+        {
+            CLR_Debug::Printf(
+                "[GCS] %s: slot=%u type=0x%02x flags=0x%02x size=%u\r\n",
+                kind,
+                (unsigned)i,
+                (unsigned)ptr->DataType(),
+                (unsigned)ptr->DataFlags(),
+                (unsigned)ptr->DataSize());
+        }
+    }
+
+    return errors;
+}
+
+// Pass 2 for one cluster: relinks its free list from the free mask, in address order as RecoverFromGC does. Each run
+// goes through OnFree, which counts it and clears its bits (the free mask's included). Returns the number of runs.
+CLR_UINT32 ApplyFreeMask(CLR_RT_HeapCluster *hc, size_t first, size_t end)
+{
+    auto freeBits = [](size_t w) { return s_allocated[w]; };
+    auto keptBits = [](size_t w) { return ~s_allocated[w]; };
+    CLR_UINT32 runs = 0;
+    CLR_RT_HeapBlock_Node *last = hc->m_freeList.Head();
+
+    last->SetPrev(nullptr);
+
+    for (size_t x = NextSet(first, end, freeBits); x < end; runs++)
+    {
+        const size_t y = NextSet(x, end, keptBits);
+        auto *node = (CLR_RT_HeapBlock_Node *)(s_base + x * c_slotSize);
+
+        node->SetDataId(CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_FREEBLOCK, CLR_RT_HeapBlock::HB_Pinned, (CLR_UINT32)(y - x)));
+        GcIncremental_OnFree(node, (CLR_UINT32)(y - x));
+
+        last->SetNext(node);
+        node->SetPrev(last);
+        last = node;
+
+        node->Debug_ClearBlock(SENTINEL_RECOVERED);
+
+        x = NextSet(y, end, freeBits);
+    }
+
+    last->SetNext(hc->m_freeList.Tail());
+    hc->m_freeList.Tail()->SetPrev(last);
+    hc->m_freeList.Tail()->SetNext(nullptr);
+
+    return runs;
+}
+
+size_t FirstSlot(const CLR_RT_HeapCluster *hc)
+{
+    return (size_t)SlotIndex(hc->m_payloadStart);
+}
+
+size_t EndSlot(const CLR_RT_HeapCluster *hc)
+{
+    return FirstSlot(hc) + (size_t)(hc->m_payloadEnd - hc->m_payloadStart);
+}
+
+// The whole bitmap sweep: every cluster's free mask is computed and checked before any heap memory is written.
+bool SweepFromBitmaps()
+{
+    CLR_UINT32 deadObjects = 0;
+    CLR_UINT32 strays = 0;
+    CLR_UINT32 orphans = 0;
+    CLR_UINT32 aliveKept = 0;
+    CLR_UINT32 errors = 0;
+    CLR_UINT32 runs = 0;
+    bool consistent = true;
+
+    memset(s_allocated, 0, BitmapWords() * sizeof(*s_allocated));
+
+    NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
+    {
+        consistent = consistent && ComputeFreeMask(FirstSlot(hc), EndSlot(hc), deadObjects);
+    }
+    NANOCLR_FOREACH_NODE_END();
+
+    if (consistent && s_stress)
+    {
+        NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
+        {
+            errors += ShadowCheck(hc, strays, orphans, aliveKept, errors);
+        }
+        NANOCLR_FOREACH_NODE_END();
+    }
+
+    if (!consistent || errors != 0)
+    {
+        CLR_Debug::Printf(
+            "[GCS] run=%u bitmap sweep %s (%u); header sweep instead\r\n",
+            (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
+            consistent ? "disagrees with the header walk" : "failed its self-check",
+            (unsigned)errors);
+
+        return false;
+    }
+
+    NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
+    {
+        runs += ApplyFreeMask(hc, FirstSlot(hc), EndSlot(hc));
+    }
+    NANOCLR_FOREACH_NODE_END();
+
+    if (s_stress)
+    {
+        CLR_Debug::Printf(
+            "[GCS] run=%u runs=%u free_blocks=%u dead_objects=%u strays_freed=%u orphans_kept=%u alive_kept=%u\r\n",
+            (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
+            (unsigned)runs,
+            (unsigned)s_sweptFreeBlocks,
+            (unsigned)deadObjects,
+            (unsigned)strays,
+            (unsigned)orphans,
+            (unsigned)aliveKept);
+    }
+
+    return true;
+}
+
 } // namespace
 
 void GcIncremental_PreWrite(const CLR_RT_HeapBlock *slot)
@@ -994,13 +1455,11 @@ void GcIncremental_ShadeObject(const CLR_RT_HeapBlock *obj)
 }
 
 // Free memory carries no bits (every path that frees clears its run; heap init and compaction rebuild), so a fresh
-// block only needs its start bit. Stress mode checks this on every allocation (alloc_dirty) as well as at every full
-// collection (bitmap_stale, bitmap_interior).
+// block only needs its own bits set: its end, and its start in the object or event bitmap. Stress mode checks this on
+// every allocation (alloc_dirty) as well as at every full collection (bitmap_stale, bitmap_interior).
 void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
 {
-    const bool isEvent = (flags & CLR_RT_HeapBlock::HB_Event) != 0;
-
-    if (!s_valid || (isEvent && !s_stress))
+    if (!s_valid)
     {
         return;
     }
@@ -1012,11 +1471,14 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
         return;
     }
 
+    const size_t size = block->DataSize();
+
     if (s_stress)
     {
-        for (size_t j = (size_t)i; j < (size_t)i + block->DataSize(); j++)
+        for (size_t j = (size_t)i; j < (size_t)i + size; j++)
         {
-            if (TestBit(s_starts, j) || TestBit(s_allocated, j) || TestBit(s_marked, j))
+            if (TestBit(s_starts, j) || TestBit(s_allocated, j) || TestBit(s_marked, j) || TestBit(s_events, j) ||
+                TestBit(s_ends, j))
             {
                 s_stats.dirtyAllocs++;
                 break;
@@ -1024,8 +1486,11 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
         }
     }
 
-    if (isEvent)
+    SetBit(s_ends, (size_t)i + size - 1);
+
+    if (flags & CLR_RT_HeapBlock::HB_Event)
     {
+        SetBit(s_events, (size_t)i);
         return;
     }
 
@@ -1040,7 +1505,7 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
     }
 
     SetBit(s_starts, (size_t)i);
-    s_allocatedSinceGc += block->DataSize();
+    s_allocatedSinceGc += size;
 
     if (g_GcIncremental_BarrierActive)
     {
@@ -1051,14 +1516,78 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
 
 void GcIncremental_OnFree(const CLR_RT_HeapBlock *block, CLR_UINT32 length)
 {
+    if (s_countingFree)
+    {
+        s_sweptFreeBlocks += length;
+    }
+
     ptrdiff_t i = s_valid ? SlotIndex(block) : -1;
 
     if (i >= 0)
     {
         ClearBits(s_starts, (size_t)i, length);
+        ClearBits(s_events, (size_t)i, length);
+        ClearBits(s_ends, (size_t)i, length);
         ClearBits(s_allocated, (size_t)i, length);
         ClearBits(s_marked, (size_t)i, length);
     }
+}
+
+void GcIncremental_OnEventSplit(const CLR_RT_HeapBlock *block, CLR_UINT32 blocks)
+{
+    ptrdiff_t i = s_valid ? SlotIndex(block) : -1;
+
+    if (i >= 0)
+    {
+        SetBit(s_ends, (size_t)i + blocks - 1);
+        SetBit(s_events, (size_t)i + blocks);
+    }
+}
+
+void GcIncremental_OnResize(const CLR_RT_HeapBlock *block, CLR_UINT32 blocks)
+{
+    ptrdiff_t i = s_valid ? SlotIndex(block) : -1;
+
+    if (i < 0 || !TestBit(s_starts, (size_t)i))
+    {
+        return;
+    }
+
+    const size_t oldSize = block->DataSize();
+
+    if (blocks == 0 || blocks >= oldSize)
+    {
+        return;
+    }
+
+    ClearBits(s_ends, (size_t)i + blocks, oldSize - blocks);
+    SetBit(s_ends, (size_t)i + blocks - 1);
+}
+
+void GcIncremental_OnEventCached(const CLR_RT_HeapBlock *block)
+{
+    ptrdiff_t i = s_valid ? SlotIndex(block) : -1;
+
+    if (i >= 0 && TestBit(s_starts, (size_t)i))
+    {
+        ClearBits(s_starts, (size_t)i, 1);
+        SetBit(s_events, (size_t)i);
+    }
+}
+
+bool GcIncremental_SetLive(const CLR_RT_HeapBlock *block)
+{
+    ptrdiff_t i = ObjectIndex(block);
+
+    if (i < 0)
+    {
+        s_bitmapSweepVeto = true;
+        return false;
+    }
+
+    SetBit(s_marked, (size_t)i);
+
+    return true;
 }
 
 void GcIncremental_OnHeapInitialized()
@@ -1069,6 +1598,10 @@ void GcIncremental_OnHeapInitialized()
     g_GcIncremental_BarrierActive = false;
     g_GcIncremental_LiveBits = nullptr;
     s_sweepPending = false;
+    s_countingFree = false;
+    s_sweptFreeReady = false;
+    s_bitmapSweepVeto = false;
+    s_bitmapSwept = false;
     s_cycleActive = false;
     s_incremental = false;
     s_allocatedSinceGc = 0;
@@ -1077,6 +1610,16 @@ void GcIncremental_OnHeapInitialized()
     if (s_starts)
     {
         platform_free(s_starts);
+    }
+
+    if (s_events)
+    {
+        platform_free(s_events);
+    }
+
+    if (s_ends)
+    {
+        platform_free(s_ends);
     }
 
     if (s_allocated)
@@ -1106,7 +1649,7 @@ void GcIncremental_OnHeapInitialized()
 
     s_verify = false;
     s_verifyInject = 0;
-    s_starts = s_allocated = s_marked = s_snapshot = s_dropped = nullptr;
+    s_starts = s_events = s_ends = s_allocated = s_marked = s_snapshot = s_dropped = nullptr;
     s_grey = nullptr;
     s_greyCount = s_greyCapacity = 0;
     s_partialArray = nullptr;
@@ -1135,10 +1678,13 @@ void GcIncremental_OnHeapInitialized()
     NANOCLR_FOREACH_NODE_END();
 
     s_starts = (CLR_UINT32 *)platform_malloc(BitmapWords() * sizeof(*s_starts));
+    s_events = (CLR_UINT32 *)platform_malloc(BitmapWords() * sizeof(*s_events));
+    s_ends = (CLR_UINT32 *)platform_malloc(BitmapWords() * sizeof(*s_ends));
     s_allocated = (CLR_UINT32 *)platform_malloc(BitmapWords() * sizeof(*s_allocated));
     s_marked = (CLR_UINT32 *)platform_malloc(BitmapWords() * sizeof(*s_marked));
 
-    if (s_starts == nullptr || s_allocated == nullptr || s_marked == nullptr)
+    if (s_starts == nullptr || s_events == nullptr || s_ends == nullptr || s_allocated == nullptr ||
+        s_marked == nullptr)
     {
         CLR_Debug::Printf("[GCI] no host memory for the heap bitmaps; incremental GC disabled\r\n");
         return;
@@ -1189,12 +1735,14 @@ void GcIncremental_OnHeapInitialized()
         const char *stress = getenv("NANOCLR_GC_INCREMENTAL_STRESS");
         s_stressEvery = stress ? (CLR_UINT32)strtoul(stress, nullptr, 10) : 0;
         s_stressCount = 0;
+        s_headerSweep = !c_bitmapSweepBuilt || EnvFlag("NANOCLR_GC_INCREMENTAL_HEADER_SWEEP");
 
         CLR_Debug::Printf(
-            "[GCC] incremental on: trigger=%u slots slice=%u slots stress_every=%u allocations\r\n",
+            "[GCC] incremental on: trigger=%u slots slice=%u slots stress_every=%u allocations sweep=%s\r\n",
             (unsigned)s_triggerSlots,
             (unsigned)s_sliceSlots,
-            (unsigned)s_stressEvery);
+            (unsigned)s_stressEvery,
+            s_headerSweep ? "header" : "bitmap");
     }
 }
 
@@ -1270,6 +1818,7 @@ bool GcIncremental_FinishCycle()
     g_GcIncremental_LiveSlots = s_slots;
     g_GcIncremental_LiveBits = s_marked;
     s_sweepPending = true;
+    s_bitmapSweepVeto = false;
 
     // Weak delegate lists were traced as strong, so the sweep has no weak lists to process. Their targets die only in a
     // collection that runs without a cycle (Mark()).
@@ -1336,9 +1885,86 @@ void GcIncremental_OnMarked()
     }
 }
 
+// The cluster walks (CLR_RT_HeapCluster::RecoverFromGC) rebuild every free list from scratch, passing each free run,
+// old free blocks included, through OnFree exactly once, as does the bitmap sweep (ApplyFreeMask) in their place;
+// nothing else frees in a collection (event blocks that RecoverEventsFromGC releases go to the event cache, not the
+// free list).
+bool GcIncremental_OnSweepHeap()
+{
+    NATIVE_PROFILE_CLR_CORE();
+
+    s_sweptFreeBlocks = 0;
+    s_countingFree = true;
+    s_sweptFreeReady = false;
+    s_bitmapSwept = false;
+
+    // Only an incremental cycle's own collection, with its live bitmap still published (verify mode unpublishes it).
+    if (g_GcIncremental_LiveBits == nullptr || s_headerSweep || s_bitmapSweepVeto)
+    {
+        return false;
+    }
+
+    s_bitmapSwept = SweepFromBitmaps();
+
+    return s_bitmapSwept;
+}
+
+bool GcIncremental_ApplySweptFree()
+{
+    NATIVE_PROFILE_CLR_CORE();
+
+    if (!s_sweptFreeReady)
+    {
+        return false;
+    }
+
+    s_sweptFreeReady = false;
+
+    CLR_RT_GarbageCollector &gc = g_CLR_RT_GarbageCollector;
+    CLR_UINT32 totalBytes = 0;
+
+    NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
+    {
+        totalBytes += (CLR_UINT32)((CLR_UINT8 *)hc->m_payloadEnd - (CLR_UINT8 *)hc->m_payloadStart);
+    }
+    NANOCLR_FOREACH_NODE_END();
+
+    const CLR_UINT32 freeBytes = (CLR_UINT32)(s_sweptFreeBlocks * sizeof(CLR_RT_HeapBlock));
+
+    if (s_stress || s_verify)
+    {
+        // Check the count against the free-list walk it replaces; keep the walk's result.
+        gc.Heap_ComputeAliveVsDeadRatio();
+
+        if (gc.m_freeBytes != freeBytes || gc.m_totalBytes != totalBytes)
+        {
+            CLR_Debug::Printf(
+                "[GCI] free count mismatch run=%u swept=%u walked=%u total=%u/%u\r\n",
+                (unsigned)gc.m_numberOfGarbageCollections,
+                (unsigned)freeBytes,
+                (unsigned)gc.m_freeBytes,
+                (unsigned)totalBytes,
+                (unsigned)gc.m_totalBytes);
+        }
+
+        return true;
+    }
+
+    gc.m_totalBytes = totalBytes;
+    gc.m_freeBytes = freeBytes;
+
+    return true;
+}
+
 void GcIncremental_OnSwept()
 {
     NATIVE_PROFILE_CLR_CORE();
+
+    if (s_countingFree)
+    {
+        s_countingFree = false;
+        s_sweptFreeReady = true;
+    }
 
     if (!s_sweepPending)
     {
@@ -1353,7 +1979,7 @@ void GcIncremental_OnSwept()
 
     CLR_Debug::Printf(
         "[GCC] cycle=%u run=%u slices=%u initial_us=%u slice_max_us=%u final_mark_us=%u live_us=%u sweep_us=%u "
-        "total_ms=%u roots=%u scanned=%u slots=%u final_scanned=%u allocated_black=%u grey_max=%u\r\n",
+        "bitmap_sweep=%u total_ms=%u roots=%u scanned=%u slots=%u final_scanned=%u allocated_black=%u grey_max=%u\r\n",
         (unsigned)s_cycleCount,
         (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
         (unsigned)s_cycle.slices,
@@ -1362,6 +1988,7 @@ void GcIncremental_OnSwept()
         (unsigned)(s_cycle.finalNs / 1000),
         (unsigned)(s_cycle.liveNs / 1000),
         (unsigned)((end - s_cycle.markedEndNs) / 1000),
+        (unsigned)s_bitmapSwept,
         (unsigned)((end - s_cycle.startNs) / 1000000),
         (unsigned)s_cycle.rootBlocks,
         (unsigned)s_cycle.scannedObjects,
@@ -1394,12 +2021,14 @@ void GcIncremental_OnFullMark()
         CLR_UINT32 orphans;
         CLR_UINT32 stale;
         CLR_UINT32 interior;
+        CLR_UINT32 blockBits;
 
-        VerifyStarts(missing, orphans, stale, interior);
+        VerifyStarts(missing, orphans, stale, interior, blockBits);
 
         CLR_Debug::Printf(
             "[GCI] full-mark run=%u prewrite=%u shade_bytes=%u weak=%u pushed=%u black=%u rejected=%u "
-            "grey_dropped=%u alloc_dirty=%u bitmap_missing=%u bitmap_orphans=%u bitmap_stale=%u bitmap_interior=%u\r\n",
+            "grey_dropped=%u alloc_dirty=%u bitmap_missing=%u bitmap_orphans=%u bitmap_stale=%u bitmap_interior=%u "
+            "bitmap_blocks=%u\r\n",
             (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
             (unsigned)s_stats.preWrites,
             (unsigned)s_stats.shadeBytes,
@@ -1412,7 +2041,8 @@ void GcIncremental_OnFullMark()
             (unsigned)missing,
             (unsigned)orphans,
             (unsigned)stale,
-            (unsigned)interior);
+            (unsigned)interior,
+            (unsigned)blockBits);
     }
 
     s_stats = {};

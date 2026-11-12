@@ -224,7 +224,7 @@ CLR_UINT32 CLR_RT_GarbageCollector::ExecuteGarbageCollection()
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Sweep);
     NANOCLR_GC_ON_SWEPT()
 
-    Heap_ComputeAliveVsDeadRatio();
+    NANOCLR_GC_COMPUTE_ALIVE_VS_DEAD_RATIO()
     NANOCLR_GC_TIMING_STAMP(gcTiming, c_GcTiming_Ratio);
 
     CheckMemoryPressure();
@@ -643,6 +643,7 @@ void CLR_RT_GarbageCollector::Sweep()
     //
     // All the dead objects are marked as such, it's time to reclaim them.
     //
+    NANOCLR_GC_ON_SWEEP_HEAP()
     {
         NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
         {

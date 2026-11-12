@@ -214,6 +214,7 @@ HRESULT CLR_RT_HeapBlock::SetReflection(const CLR_RT_ReflectionDef_Index &reflex
     NANOCLR_HEADER();
 
     NANOCLR_GC_PRE_WRITE(this)
+    NANOCLR_GC_ON_RESIZE(this, 1)
     m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_REFLECTION, 0, 1);
     m_data.reflection = reflex;
 
@@ -226,6 +227,7 @@ HRESULT CLR_RT_HeapBlock::SetReflection(const CLR_RT_Assembly_Index &assm)
     NANOCLR_HEADER();
 
     NANOCLR_GC_PRE_WRITE(this)
+    NANOCLR_GC_ON_RESIZE(this, 1)
     m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_REFLECTION, 0, 1);
     m_data.reflection.kind = REFLECTION_ASSEMBLY;
     m_data.reflection.levels = 0;
@@ -240,6 +242,7 @@ HRESULT CLR_RT_HeapBlock::SetReflection(const CLR_RT_TypeSpec_Index &typeSpec)
     NANOCLR_HEADER();
 
     NANOCLR_GC_PRE_WRITE(this)
+    NANOCLR_GC_ON_RESIZE(this, 1)
     m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_REFLECTION, 0, 1);
     m_data.reflection.kind = REFLECTION_TYPESPEC;
     m_data.reflection.levels = 0;
@@ -254,6 +257,7 @@ HRESULT CLR_RT_HeapBlock::SetReflection(const CLR_RT_TypeDef_Index &cls)
     NANOCLR_HEADER();
 
     NANOCLR_GC_PRE_WRITE(this)
+    NANOCLR_GC_ON_RESIZE(this, 1)
     m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_REFLECTION, 0, 1);
     m_data.reflection.kind = REFLECTION_TYPE;
     m_data.reflection.levels = 0;
@@ -268,6 +272,7 @@ HRESULT CLR_RT_HeapBlock::SetReflection(const CLR_RT_FieldDef_Index &fd)
     NANOCLR_HEADER();
 
     NANOCLR_GC_PRE_WRITE(this)
+    NANOCLR_GC_ON_RESIZE(this, 1)
     m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_REFLECTION, 0, 1);
     m_data.reflection.kind = REFLECTION_FIELD;
     m_data.reflection.levels = 0;
@@ -289,6 +294,7 @@ HRESULT CLR_RT_HeapBlock::SetReflection(const CLR_RT_MethodDef_Index &md)
     }
 
     NANOCLR_GC_PRE_WRITE(this)
+    NANOCLR_GC_ON_RESIZE(this, 1)
     m_id.raw = CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_REFLECTION, 0, 1);
     m_data.reflection.kind =
         (inst.target->flags & CLR_RECORD_METHODDEF::MD_Constructor) ? REFLECTION_CONSTRUCTOR : REFLECTION_METHOD;

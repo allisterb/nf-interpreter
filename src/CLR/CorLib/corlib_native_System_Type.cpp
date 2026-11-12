@@ -567,7 +567,9 @@ HRESULT Library_corlib_native_System_Type::GetTypeFromHandle___STATIC__SystemTyp
 
     NANOCLR_CHECK_HRESULT(g_CLR_RT_ExecutionEngine.NewObjectFromIndex(top, g_CLR_RT_WellKnownTypes.TypeStatic));
     hbObj = top.Dereference();
+    NANOCLR_GC_ON_RESIZE(hbObj, pThis.DataSize())
     hbObj->Assign(pThis); // RuntimeTypeHandle and Type have the same representation.
+    NANOCLR_GC_ON_HEADER_COPIED(hbObj)
 
     NANOCLR_NOCLEANUP();
 }

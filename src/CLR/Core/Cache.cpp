@@ -506,6 +506,7 @@ CLR_UINT32 CLR_RT_EventCache::EventCache_Cleanup()
         NANOCLR_FOREACH_NODE(CLR_RT_HeapBlock_Node, ptr, lst->m_blocks)
         {
             ptr->SetDataId(CLR_RT_HEAPBLOCK_RAW_ID(DATATYPE_FREEBLOCK, CLR_RT_HeapBlock::HB_Pinned, ptr->DataSize()));
+            NANOCLR_GC_ON_FREE(ptr, ptr->DataSize())
             ptr->ClearData();
 
             tot += ptr->DataSize();
@@ -529,6 +530,7 @@ void CLR_RT_EventCache::Append_Node(CLR_RT_HeapBlock *node)
     CLR_UINT32 blocks = ptr->DataSize();
     BoundedList &lst = m_events[blocks < c_maxFastLists ? blocks : 0];
 
+    NANOCLR_GC_ON_EVENT_CACHED(ptr)
     ptr->ChangeDataType(DATATYPE_CACHEDBLOCK);
     ptr->ChangeDataFlags(CLR_RT_HeapBlock::HB_Alive | CLR_RT_HeapBlock::HB_Event);
 
@@ -589,6 +591,7 @@ CLR_RT_HeapBlock *CLR_RT_EventCache::Extract_Node_Slow(CLR_UINT32 dataType, CLR_
                 (CLR_RT_HeapBlock::HB_Alive | CLR_RT_HeapBlock::HB_Event),
                 (bestSize - blocks)));
             next->ClearData();
+            NANOCLR_GC_ON_EVENT_SPLIT(node, blocks)
 
             Append_Node(next);
         }
