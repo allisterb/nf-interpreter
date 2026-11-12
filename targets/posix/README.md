@@ -156,18 +156,27 @@ IPv4 addresses exposed by the managed snapshot.
   - **Bitmap sweep:** that collection rebuilds the free lists from the bitmaps instead of walking
     every block header. The bitmaps hold object starts, event-block starts and block ends, and the
     collection writes only the first header of each free run.
-    - It checks the bitmaps against themselves first and falls back to the header walk if they
-      disagree, printing `[GCS] self-check: ...`.
+    - It sweeps one heap cluster (about 1.5 MiB) at a time, checking that cluster's bitmaps against
+      themselves before writing any of its memory. A cluster whose bitmaps disagree falls back to
+      the header walk on its own, printing `[GCS] self-check: ...` and
+      `[GCS] run=... cluster at slot ...: ...; header sweep instead`. So does a cluster holding a
+      block marked alive that is not an object start; if there are more than 8 of those, or one
+      off the block grid, the whole collection uses the header walk.
+    - `NANOCLR_GC_INCREMENTAL_SWEEP_FALLBACK=N` sends every Nth cluster the bitmap sweep would
+      take to the header walk instead, to test the fallback. These are counted in
+      `fallback_clusters` but not printed. The startup line shows the setting as `fallback_every`.
     - `NANOCLR_GC_INCREMENTAL_HEADER_SWEEP=1` always uses the header walk.
     - Collections without a cycle, and cycles under verify mode, always use the header walk.
     - Blocks alive only through a stale `HB_Alive`, such as the slots `SetReflection` cuts off an
       object, are freed one collection earlier than by the header walk.
     - With `NANOCLR_GC_BARRIER_STRESS=1`, every bitmap sweep is first compared with what the header
-      walk would free. Any disagreement other than such blocks is printed and the header walk runs
-      instead. Each collection then prints:
+      walk would free, cluster by cluster. Any disagreement other than such blocks is printed
+      (`[GCS] split: ...`, `kept-dead` or `freed-live`) and that cluster takes the header walk
+      instead. `strays_freed`, `orphans_kept` and `alive_kept` count only the clusters the bitmap
+      sweep kept; `free_blocks` counts the free blocks of every cluster. Each collection then prints:
 
       ```text
-      [GCS] run=12 runs=... free_blocks=... dead_objects=... strays_freed=... orphans_kept=0 alive_kept=0
+      [GCS] run=12 runs=... free_blocks=... dead_objects=... strays_freed=... orphans_kept=0 alive_kept=0 fallback_clusters=0
       ```
 
       `orphans_kept` and `alive_kept` should be 0. `orphans_kept` counts slots cut off an object by a
@@ -201,25 +210,29 @@ IPv4 addresses exposed by the managed snapshot.
       aborts the cycle. That collection is a stop-the-world one, which costs far more than the print.
 
     ```text
-    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=...
+    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=... fallback_clusters=...
     ```
 
     - `final_mark_us` is the final pause's marking: draining what is still grey, the finalizer
-      pass, and `live_us`, which builds the live bitmap (marked or allocated during the cycle).
+      pass, and `live_us`, which publishes the live bitmap. Objects allocated during the cycle are
+      marked as they are allocated, so `live_us` is close to 0.
     - `sweep_us` is the rest of the final pause: weak references and the sweep, which reads
       liveness from the live bitmap rather than from a heap walk that copies it into `HB_Alive`.
       With `NANOCLR_GC_VERIFY=1` it includes verify mode's second mark.
     - `sweep_us` splits into `pre_us` (verify mode's second mark, weak references and
       `RecoverEventsFromGC`), `heap_us` (the heap sweep) and `post_us` (clearing the cycle's
       bitmaps). For a bitmap sweep, `heap_us` splits further into `clear_us` (the scratch bitmap),
-      `mask_us` (the free mask and its self-check, plus the shadow check under barrier stress) and
-      `apply_us` (clearing the freed slots' start, event and end bits in one pass over the bitmaps,
-      then writing the free runs, plus the `[GCS]` line under barrier stress), with the
-      `free_runs` written and `dead_objects` freed. `clear_us`, `mask_us`, `apply_us`, `free_runs`
-      and `dead_objects` are 0 after a header walk. Each part is truncated to whole microseconds on
-      its own, so the parts can add up to a microsecond or two less than the whole.
+      `mask_us` (every cluster's free mask and its self-check, plus the shadow check under barrier
+      stress) and `apply_us` (the rest: for each cluster, clearing the freed slots' start, event and
+      end bits in one pass over its bitmap words, then writing the free runs, or the header walk for
+      a cluster that fell back; plus the `[GCS]` lines), with the `free_runs` the bitmap sweep
+      wrote, the `dead_objects` it freed, and the `fallback_clusters` that took the header walk.
+      `clear_us`, `mask_us`, `apply_us`, `free_runs`, `dead_objects` and `fallback_clusters` are 0
+      after a header walk. Each part is truncated to whole microseconds on its own, so the parts can
+      add up to a microsecond or two less than the whole.
     - `total_ms` runs from the initial pause to the end of the sweep.
-    - `bitmap_sweep` is 1 when the bitmap sweep ran and 0 when the header walk did.
+    - `bitmap_sweep` is 1 when the bitmap sweep ran, even if some clusters fell back, and 0 when
+      the header walk did for the whole heap.
     - `final_scanned` counts the objects still grey at that point. It is 0 when the slices kept up.
 - `NANOCLR_GC_BARRIER_STRESS=1` in the environment turns the barrier on for the whole run. Shades are
   validated and counted but never marked, and each collection checks the object-start bitmap against

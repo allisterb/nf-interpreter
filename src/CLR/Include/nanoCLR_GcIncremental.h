@@ -52,7 +52,8 @@ inline bool GcIncremental_IsLive(const void *p, size_t blockSize)
 }
 
 // While g_GcIncremental_LiveBits is published: marks block alive in it and returns true if block is an object start;
-// otherwise returns false (the caller sets HB_Alive) and the collection keeps the header sweep.
+// otherwise returns false (the caller sets HB_Alive) and the block's heap cluster takes the header sweep (the whole
+// heap does if there are too many such blocks, or one is off the block grid).
 bool GcIncremental_SetLive(const CLR_RT_HeapBlock *block);
 
 // Deletion barrier: before *slot is overwritten, shade the object it references.
@@ -82,7 +83,8 @@ void GcIncremental_OnFullMark();
 // Mark() has finished: verify mode checks its result here.
 void GcIncremental_OnMarked();
 // Sweep() is about to rebuild the free lists: from here to OnSwept, every free run is counted. After an incremental
-// cycle it rebuilds them from the bitmaps alone and returns true; it returns false when the cluster walks must run.
+// cycle it rebuilds them from the bitmaps and returns true, walking the headers of any cluster whose bitmaps fail a
+// check; it returns false when the cluster walks must run for the whole heap.
 bool GcIncremental_OnSweepHeap();
 // Sweep() has finished: an incremental cycle's live bitmap is retired here, and its "[GCC]" line kept for OnQuantum.
 void GcIncremental_OnSwept();

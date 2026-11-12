@@ -43,11 +43,11 @@
 // A collection requested mid-cycle (GC.Collect, an allocation failure) discards the cycle and runs Mark(), for the
 // exact result. Weak delegate lists are traced as strong during a cycle, so while cycles keep running their targets are
 // collected only by a collection that runs without one. Compaction aborts a cycle, as does a lost grey push (the final
-// pause then runs Mark()). A finished cycle's sweep rebuilds the free lists from the bitmaps (SweepFromBitmaps) unless
-// they fail their self-check. With NANOCLR_GC_INCREMENTAL_STATS=1 each finished cycle prints one "[GCC]" line, at the
-// next quantum boundary so that the print is not part of the pause. GC-stress mode
-// (NANOCLR_GC_INCREMENTAL_STRESS=N) also starts a cycle or runs a slice every N object allocations, from inside the
-// allocator, so marking interleaves with native code as well as with IL.
+// pause then runs Mark()). A finished cycle's sweep rebuilds the free lists from the bitmaps (SweepFromBitmaps),
+// cluster by cluster; a cluster whose bitmaps fail their self-check walks its headers instead. With
+// NANOCLR_GC_INCREMENTAL_STATS=1 each finished cycle prints one "[GCC]" line, at the next quantum boundary so that the
+// print is not part of the pause. GC-stress mode (NANOCLR_GC_INCREMENTAL_STRESS=N) also starts a cycle or runs a slice
+// every N object allocations, from inside the allocator, so marking interleaves with native code as well as with IL.
 
 #include "Core.h"
 
@@ -84,14 +84,16 @@ struct GcIncrementalCycle
     uint64_t initialNs;   // initial pause: root snapshot
     uint64_t sliceMaxNs;  // longest mark slice
     uint64_t finalNs;     // final pause, mark part: drain, finalizer pass, live bitmap (sweep not included)
-    uint64_t liveNs;      // building the live bitmap (marked | allocated)
+    uint64_t liveNs;      // publishing the live bitmap (s_marked)
     uint64_t markedEndNs; // end of the mark part; the rest of the final pause is MarkWeak and the sweep
     uint64_t heapNs;      // the heap sweep starts (after verify's mark, MarkWeak, weak delegates, RecoverEventsFromGC)
     uint64_t clearedNs;   // bitmap sweep: scratch bitmap cleared
-    uint64_t maskedNs;    // bitmap sweep: free mask computed and self-checked (and shadow-checked under stress)
+    uint64_t maskedNs;    // bitmap sweep: clearedNs plus the time every cluster spent computing and checking its free
+                          // mask (self-check, and shadow check under stress); the rest of the sweep is applying
     uint64_t sweptNs;     // the heap sweep ends (OnSwept)
     CLR_UINT32 freeRuns;  // bitmap sweep: free runs written
-    CLR_UINT32 deadObjects; // bitmap sweep: dead objects freed
+    CLR_UINT32 deadObjects;      // bitmap sweep: dead objects freed
+    CLR_UINT32 fallbackClusters; // bitmap sweep: clusters that took the header sweep instead
     CLR_UINT32 slices;
     CLR_UINT32 rootBlocks;
     CLR_UINT32 scannedObjects;
@@ -118,6 +120,7 @@ const size_t c_arrayChunk = 1024;              // reference arrays longer than t
 const CLR_UINT32 c_verifyReportedMisses = 5;   // misses printed in detail per collection
 const CLR_UINT32 c_verifyReportedFloating = 3; // floating objects printed in detail per collection
 const CLR_UINT32 c_sweepReportedErrors = 5;    // bitmap-sweep disagreements printed in detail per collection
+const size_t c_vetoSlots = 8;                  // veto slots kept per collection before every cluster is vetoed
 
 // The bitmap sweep writes free-run headers only, so it is built only when no heap debugging needs every dead block
 // visited (CLR_RT_HeapCluster::RecoverFromGC: early-collection tracing, allocation profiling, heap validation).
@@ -145,9 +148,10 @@ size_t s_slots;
 CLR_UINT32 *s_starts;    // object-start bitmap
 CLR_UINT32 *s_events;    // event-block-start bitmap
 CLR_UINT32 *s_ends;      // last slot of every object and event block
-CLR_UINT32 *s_allocated; // allocated-this-cycle bitmap
-CLR_UINT32 *s_marked;    // incremental cycle: shaded (grey or black) objects and marked root slots; from the final
-                         // pause to the sweep, the live bitmap (marked | allocated)
+CLR_UINT32 *s_allocated; // allocated while a cycle marks; the bitmap sweep's free mask; clear from OnSwept (or an
+                         // abort) to the next StartCycle
+CLR_UINT32 *s_marked;    // incremental cycle: shaded (grey or black) objects, objects allocated black and marked root
+                         // slots; from the final pause to the sweep, the live bitmap
 const CLR_RT_HeapBlock **s_grey;
 size_t s_greyCount;
 size_t s_greyCapacity;
@@ -164,7 +168,6 @@ bool s_countingFree;       // between OnSweepHeap and OnSwept: free runs are cou
 bool s_sweptFreeReady;     // s_sweptFreeBlocks holds a complete sweep's count, not yet applied
 size_t s_sweptFreeBlocks;  // blocks in the free runs the sweep rebuilt the free lists from
 bool s_headerSweep;        // NANOCLR_GC_INCREMENTAL_HEADER_SWEEP=1: never sweep from the bitmaps
-bool s_bitmapSweepVeto;    // MarkAlive() hit a block that is not an object start while the bitmap was published
 bool s_bitmapSwept;        // the last cycle's free lists were rebuilt from the bitmaps
 size_t s_triggerSlots;     // start a cycle once this many slots were allocated since the last collection
 size_t s_sliceSlots;       // marking budget per quantum, in slots scanned
@@ -176,6 +179,16 @@ GcIncrementalCycle s_cycle;
 bool s_cycleStats;    // NANOCLR_GC_INCREMENTAL_STATS=1: report each finished cycle on a "[GCC]" line
 bool s_reportPending; // s_report holds a line not yet printed
 GcIncrementalReport s_report;
+
+// Blocks MarkAlive() hit that are not object starts while the live bitmap was published: their clusters take the
+// header sweep. A count above c_vetoSlots (more of them, or one off the slot grid) sends the whole heap there.
+size_t s_vetoSlots[c_vetoSlots];
+size_t s_vetoCount;
+
+// NANOCLR_GC_INCREMENTAL_SWEEP_FALLBACK=N: every Nth cluster the bitmap sweep would take goes to the header sweep, to
+// test the per-cluster fallback.
+CLR_UINT32 s_sweepFallbackEvery;
+CLR_UINT32 s_sweepFallbackCount;
 
 uint64_t NowNs()
 {
@@ -342,8 +355,8 @@ ptrdiff_t ObjectIndex(const CLR_RT_HeapBlock *obj)
     return i >= 0 && TestBit(s_starts, (size_t)i) && IsObjectBlock(obj) ? i : -1;
 }
 
-// Greys obj if it is an object not yet shaded or allocated this cycle. During a cycle the mark bit is set on push, so
-// an object is pushed at most once; in barrier stress mode without a cycle nothing is marked.
+// Greys obj if it is an object not yet shaded or allocated this cycle (both set its mark bit). During a cycle the mark
+// bit is set on push, so an object is pushed at most once; in barrier stress mode without a cycle nothing is marked.
 void Shade(const CLR_RT_HeapBlock *obj)
 {
     if (obj == nullptr)
@@ -359,7 +372,7 @@ void Shade(const CLR_RT_HeapBlock *obj)
         return;
     }
 
-    if (TestBit(s_marked, (size_t)i) || TestBit(s_allocated, (size_t)i))
+    if (TestBit(s_marked, (size_t)i))
     {
         s_stats.alreadyBlack++;
         return;
@@ -749,7 +762,8 @@ void PrintReport(const GcIncrementalReport &r)
     CLR_Debug::Printf(
         "[GCC] cycle=%u run=%u slices=%u initial_us=%u slice_max_us=%u final_mark_us=%u live_us=%u sweep_us=%u "
         "bitmap_sweep=%u total_ms=%u roots=%u scanned=%u slots=%u final_scanned=%u allocated_black=%u grey_max=%u "
-        "pre_us=%u heap_us=%u clear_us=%u mask_us=%u apply_us=%u post_us=%u free_runs=%u dead_objects=%u\r\n",
+        "pre_us=%u heap_us=%u clear_us=%u mask_us=%u apply_us=%u post_us=%u free_runs=%u dead_objects=%u "
+        "fallback_clusters=%u\r\n",
         (unsigned)r.number,
         (unsigned)r.run,
         (unsigned)c.slices,
@@ -773,7 +787,8 @@ void PrintReport(const GcIncrementalReport &r)
         phases ? us(c.maskedNs, c.sweptNs) : 0u,
         us(c.sweptNs, r.endNs),
         phases ? (unsigned)c.freeRuns : 0u,
-        phases ? (unsigned)c.deadObjects : 0u);
+        phases ? (unsigned)c.deadObjects : 0u,
+        phases ? (unsigned)c.fallbackClusters : 0u);
 }
 
 // GC-stress mode (NANOCLR_GC_INCREMENTAL_STRESS=N), every N object allocations, from inside the allocator: start a
@@ -1131,17 +1146,33 @@ void VerifyMark()
 }
 
 // Bitmap sweep (task 0002, "After GO: bitmap-only sweep"): the free lists rebuilt from the bitmaps, after an
-// incremental cycle, writing only the header of each free run. s_allocated was merged into the live bitmap (s_marked)
-// by the final pause, so it holds the free mask meanwhile.
+// incremental cycle, writing only the header of each free run. Allocation during the cycle set s_marked as well, so
+// s_marked is the live bitmap and s_allocated holds the free mask meanwhile.
+
+size_t FirstSlot(const CLR_RT_HeapCluster *hc)
+{
+    return (size_t)SlotIndex(hc->m_payloadStart);
+}
+
+size_t EndSlot(const CLR_RT_HeapCluster *hc)
+{
+    return FirstSlot(hc) + (size_t)(hc->m_payloadEnd - hc->m_payloadStart);
+}
 
 // Prints why the bitmap sweep's self-check failed, with the blocks the header walk finds around slot (each as
-// slot:type/flags/size, its S and V bits, the E bit on its last slot and the E bits inside it).
+// slot:type/flags/size, its S and V bits, the E bit on its last slot and the E bits inside it). Walks only the clusters
+// near slot: a systematic fault fails every cluster's check.
 bool SelfCheckFailed(const char *why, size_t slot)
 {
     CLR_Debug::Printf("[GCS] self-check: %s at slot=%u", why, (unsigned)slot);
 
     NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
     {
+        if (EndSlot(hc) + 24 <= slot || FirstSlot(hc) > slot + 4)
+        {
+            continue;
+        }
+
         for (CLR_RT_HeapBlock_Node *ptr = hc->m_payloadStart; ptr < hc->m_payloadEnd; ptr += ptr->DataSize())
         {
             const size_t i = (size_t)SlotIndex(ptr);
@@ -1292,13 +1323,15 @@ bool ComputeFreeMask(size_t first, size_t end, CLR_UINT32 &deadObjects)
 // differences: a stray (a block alive only through HB_Alive, without a live bit, which the bitmap sweep frees a
 // collection earlier), and an orphan slot the bitmap sweep keeps because it lies inside a live object's extent, which
 // happens only when a truncation missed NANOCLR_GC_ON_RESIZE. Also counts kept non-event blocks still carrying
-// HB_Alive, which no bitmap sweep clears. Returns the other disagreements, printing the first few.
+// HB_Alive, which no bitmap sweep clears. Returns the other disagreements, printing the first few, and the first stray
+// if reportStray.
 CLR_UINT32 ShadowCheck(
     CLR_RT_HeapCluster *hc,
     CLR_UINT32 &strays,
     CLR_UINT32 &orphans,
     CLR_UINT32 &aliveKept,
-    CLR_UINT32 reported)
+    CLR_UINT32 reported,
+    bool reportStray)
 {
     CLR_UINT32 errors = 0;
     auto freeBits = [](size_t w) { return s_allocated[w]; };
@@ -1337,7 +1370,7 @@ CLR_UINT32 ShadowCheck(
         {
             if (!ptr->IsEvent() && !(TestBit(s_starts, i) && TestBit(s_marked, i)))
             {
-                if (strays++ == 0)
+                if (strays++ == 0 && reportStray)
                 {
                     CLR_Debug::Printf(
                         "[GCS] first stray: slot=%u type=0x%02x flags=0x%02x size=%u S=%u\r\n",
@@ -1369,18 +1402,30 @@ CLR_UINT32 ShadowCheck(
     return errors;
 }
 
-// Free memory carries no start, event or end bits: clears them under the whole free mask in one word pass, in place of
-// OnFree's per-run clearing. The live and scratch bitmaps are left to ClearCycleBitmaps (OnSwept). Runs only once the
-// sweep is committed (after the self-check and the shadow check, which reads s_starts).
-void ClearFreedBits()
+// Free memory carries no start, event or end bits: clears them under the cluster payload [first, end)'s free mask in
+// one word pass, in place of OnFree's per-run clearing. The boundary words are shared with the neighbouring clusters,
+// so only the range is touched. The live and scratch bitmaps are left to ClearCycleBitmaps (OnSwept). Runs only once
+// the cluster's sweep is committed (after the self-check and the shadow check, which reads s_starts).
+void ClearFreedBits(size_t first, size_t end)
 {
-    for (size_t w = 0, words = BitmapWords(); w < words; w++)
-    {
-        const CLR_UINT32 kept = ~s_allocated[w];
+    const size_t firstWord = first / c_bitsPerWord;
+    const size_t lastWord = (end - 1) / c_bitsPerWord;
+    auto clear = [](size_t w, CLR_UINT32 freed) {
+        s_starts[w] &= ~freed;
+        s_events[w] &= ~freed;
+        s_ends[w] &= ~freed;
+    };
 
-        s_starts[w] &= kept;
-        s_events[w] &= kept;
-        s_ends[w] &= kept;
+    clear(firstWord, s_allocated[firstWord] & RangeMask(firstWord, first, end));
+
+    for (size_t w = firstWord + 1; w < lastWord; w++)
+    {
+        clear(w, s_allocated[w]);
+    }
+
+    if (lastWord != firstWord)
+    {
+        clear(lastWord, s_allocated[lastWord] & RangeMask(lastWord, first, end));
     }
 }
 
@@ -1421,18 +1466,28 @@ CLR_UINT32 ApplyFreeMask(CLR_RT_HeapCluster *hc, size_t first, size_t end)
     return runs;
 }
 
-size_t FirstSlot(const CLR_RT_HeapCluster *hc)
+// A cluster takes the header sweep if a block in it was vetoed (GcIncremental_SetLive). An overflowed list (the whole
+// heap takes the header sweep, so OnSweepHeap never gets this far) is only searched for its recorded slots.
+bool Vetoed(size_t first, size_t end)
 {
-    return (size_t)SlotIndex(hc->m_payloadStart);
+    for (size_t k = 0, count = s_vetoCount < c_vetoSlots ? s_vetoCount : c_vetoSlots; k < count; k++)
+    {
+        if (s_vetoSlots[k] >= first && s_vetoSlots[k] < end)
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
-size_t EndSlot(const CLR_RT_HeapCluster *hc)
-{
-    return FirstSlot(hc) + (size_t)(hc->m_payloadEnd - hc->m_payloadStart);
-}
-
-// The whole bitmap sweep: every cluster's free mask is computed and checked before any heap memory is written.
-bool SweepFromBitmaps()
+// The bitmap sweep, one cluster at a time: each cluster's free mask is computed and checked before any of its memory is
+// written, then applied. A cluster whose mask fails a check, or that holds a vetoed block, takes the header sweep
+// (RecoverFromGC) instead, with the live bitmap still published: IsAlive() is header or live bit, so it keeps what the
+// bitmap sweep would keep, and its runs go through OnFree, which clears their bits and counts them. Clusters are
+// independent: no block spans two, and every bitmap operation covers only the cluster's own slots (SelfCheckFailed's
+// diagnostic walk reads its neighbours' headers, which a committed cluster leaves walkable).
+void SweepFromBitmaps()
 {
     CLR_UINT32 deadObjects = 0;
     CLR_UINT32 strays = 0;
@@ -1440,63 +1495,99 @@ bool SweepFromBitmaps()
     CLR_UINT32 aliveKept = 0;
     CLR_UINT32 errors = 0;
     CLR_UINT32 runs = 0;
-    bool consistent = true;
+    CLR_UINT32 fallbacks = 0;
+    uint64_t maskNs = 0;
 
     memset(s_allocated, 0, BitmapWords() * sizeof(*s_allocated));
     s_cycle.clearedNs = NowNs();
 
     NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
     {
-        consistent = consistent && ComputeFreeMask(FirstSlot(hc), EndSlot(hc), deadObjects);
-    }
-    NANOCLR_FOREACH_NODE_END();
+        const size_t first = FirstSlot(hc);
+        const size_t end = EndSlot(hc);
+        const uint64_t start = s_cycleStats ? NowNs() : 0;
+        CLR_UINT32 clusterDead = 0;
+        CLR_UINT32 clusterStrays = 0;
+        CLR_UINT32 clusterOrphans = 0;
+        CLR_UINT32 clusterAliveKept = 0;
+        CLR_UINT32 clusterErrors = 0;
+        const char *why = nullptr;
+        bool forced = false;
 
-    if (consistent && s_stress)
-    {
-        NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
+        if (Vetoed(first, end))
         {
-            errors += ShadowCheck(hc, strays, orphans, aliveKept, errors);
+            why = "has a vetoed block";
         }
-        NANOCLR_FOREACH_NODE_END();
-    }
+        else if (!ComputeFreeMask(first, end, clusterDead))
+        {
+            why = "failed its self-check";
+        }
+        else if (
+            s_stress &&
+            (clusterErrors = ShadowCheck(hc, clusterStrays, clusterOrphans, clusterAliveKept, errors, strays == 0)) !=
+                0)
+        {
+            why = "disagrees with the header walk";
+        }
+        else if (s_sweepFallbackEvery != 0 && ++s_sweepFallbackCount >= s_sweepFallbackEvery)
+        {
+            // Not printed: only counted in fallback_clusters, so a test run's pauses and problem lines stay clean.
+            s_sweepFallbackCount = 0;
+            forced = true;
+        }
 
-    if (!consistent || errors != 0)
-    {
-        CLR_Debug::Printf(
-            "[GCS] run=%u bitmap sweep %s (%u); header sweep instead\r\n",
-            (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
-            consistent ? "disagrees with the header walk" : "failed its self-check",
-            (unsigned)errors);
+        if (s_cycleStats)
+        {
+            maskNs += NowNs() - start;
+        }
 
-        return false;
-    }
+        if (why == nullptr && !forced)
+        {
+            ClearFreedBits(first, end);
+            runs += ApplyFreeMask(hc, first, end);
+            deadObjects += clusterDead;
+            strays += clusterStrays;
+            orphans += clusterOrphans;
+            aliveKept += clusterAliveKept;
+            continue;
+        }
 
-    s_cycle.maskedNs = NowNs();
-    ClearFreedBits();
+        errors += clusterErrors;
+        fallbacks++;
 
-    NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
-    {
-        runs += ApplyFreeMask(hc, FirstSlot(hc), EndSlot(hc));
+        if (why != nullptr)
+        {
+            CLR_Debug::Printf(
+                "[GCS] run=%u cluster at slot %u: bitmap sweep %s (%u); header sweep instead\r\n",
+                (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
+                (unsigned)first,
+                why,
+                (unsigned)clusterErrors);
+        }
+
+        hc->RecoverFromGC();
     }
     NANOCLR_FOREACH_NODE_END();
 
+    s_cycle.maskedNs = s_cycle.clearedNs + maskNs;
     s_cycle.freeRuns = runs;
     s_cycle.deadObjects = deadObjects;
+    s_cycle.fallbackClusters = fallbacks;
 
     if (s_stress)
     {
         CLR_Debug::Printf(
-            "[GCS] run=%u runs=%u free_blocks=%u dead_objects=%u strays_freed=%u orphans_kept=%u alive_kept=%u\r\n",
+            "[GCS] run=%u runs=%u free_blocks=%u dead_objects=%u strays_freed=%u orphans_kept=%u alive_kept=%u "
+            "fallback_clusters=%u\r\n",
             (unsigned)g_CLR_RT_GarbageCollector.m_numberOfGarbageCollections,
             (unsigned)runs,
             (unsigned)s_sweptFreeBlocks,
             (unsigned)deadObjects,
             (unsigned)strays,
             (unsigned)orphans,
-            (unsigned)aliveKept);
+            (unsigned)aliveKept,
+            (unsigned)fallbacks);
     }
-
-    return true;
 }
 
 } // namespace
@@ -1593,9 +1684,12 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
     SetBit(s_starts, (size_t)i);
     s_allocatedSinceGc += size;
 
-    if (g_GcIncremental_BarrierActive)
+    // Allocate black, only while marking (barrier stress mode keeps the barrier on between cycles too), so the cycle
+    // bitmaps stay clear between cycles. The mark bit makes s_marked the live bitmap when marking ends.
+    if (s_cycleActive)
     {
         SetBit(s_allocated, (size_t)i);
+        SetBit(s_marked, (size_t)i);
         s_cycle.allocatedBlack++;
     }
 }
@@ -1667,7 +1761,22 @@ bool GcIncremental_SetLive(const CLR_RT_HeapBlock *block)
 
     if (i < 0)
     {
-        s_bitmapSweepVeto = true;
+        // Its cluster's sweep must read its header. Off the slot grid (or past the kept slots) every cluster does.
+        const ptrdiff_t slot = SlotIndex(block);
+
+        if (slot >= 0 && Vetoed((size_t)slot, (size_t)slot + 1))
+        {
+            // Already recorded: the same block is often hit more than once.
+        }
+        else if (slot >= 0 && s_vetoCount < c_vetoSlots)
+        {
+            s_vetoSlots[s_vetoCount++] = (size_t)slot;
+        }
+        else
+        {
+            s_vetoCount = c_vetoSlots + 1;
+        }
+
         return false;
     }
 
@@ -1693,7 +1802,7 @@ void GcIncremental_OnHeapInitialized()
     s_sweepPending = false;
     s_countingFree = false;
     s_sweptFreeReady = false;
-    s_bitmapSweepVeto = false;
+    s_vetoCount = 0;
     s_bitmapSwept = false;
     s_cycleActive = false;
     s_incremental = false;
@@ -1833,13 +1942,19 @@ void GcIncremental_OnHeapInitialized()
         s_headerSweep = !c_bitmapSweepBuilt || EnvFlag("NANOCLR_GC_INCREMENTAL_HEADER_SWEEP");
         s_cycleStats = EnvFlag("NANOCLR_GC_INCREMENTAL_STATS");
 
+        const char *fallback = getenv("NANOCLR_GC_INCREMENTAL_SWEEP_FALLBACK");
+        s_sweepFallbackEvery = fallback ? (CLR_UINT32)strtoul(fallback, nullptr, 10) : 0;
+        s_sweepFallbackCount = 0;
+
         CLR_Debug::Printf(
-            "[GCC] incremental on: trigger=%u slots slice=%u slots stress_every=%u allocations sweep=%s stats=%u\r\n",
+            "[GCC] incremental on: trigger=%u slots slice=%u slots stress_every=%u allocations sweep=%s stats=%u "
+            "fallback_every=%u clusters\r\n",
             (unsigned)s_triggerSlots,
             (unsigned)s_sliceSlots,
             (unsigned)s_stressEvery,
             s_headerSweep ? "header" : "bitmap",
-            (unsigned)s_cycleStats);
+            (unsigned)s_cycleStats,
+            (unsigned)s_sweepFallbackEvery);
     }
 }
 
@@ -1884,7 +1999,7 @@ bool GcIncremental_FinishCycle()
     {
         ptrdiff_t i = ObjectIndex(fin->m_object);
 
-        if (i >= 0 && !TestBit(s_marked, (size_t)i) && !TestBit(s_allocated, (size_t)i))
+        if (i >= 0 && !TestBit(s_marked, (size_t)i))
         {
             Shade(fin->m_object);
             Drain((size_t)-1);
@@ -1903,19 +2018,14 @@ bool GcIncremental_FinishCycle()
     s_cycle.finalScannedObjects = s_cycle.scannedObjects - scannedBefore;
     uint64_t liveStart = NowNs();
 
-    // The live bitmap: marked or allocated black. It is published for IsAlive() until OnSwept, in place of a heap walk
-    // setting HB_Alive: MarkWeak and the sweep read it, and the sweep's own walk does the rest.
-    for (size_t w = 0, words = BitmapWords(); w < words; w++)
-    {
-        s_marked[w] |= s_allocated[w];
-    }
-
+    // The live bitmap is s_marked (marked or allocated black). It is published for IsAlive() until OnSwept, in place of
+    // a heap walk setting HB_Alive: MarkWeak and the sweep read it, and the sweep's own walk does the rest.
     StopMarking();
     g_GcIncremental_LiveBase = s_base;
     g_GcIncremental_LiveSlots = s_slots;
     g_GcIncremental_LiveBits = s_marked;
     s_sweepPending = true;
-    s_bitmapSweepVeto = false;
+    s_vetoCount = 0;
 
     // Weak delegate lists were traced as strong, so the sweep has no weak lists to process. Their targets die only in a
     // collection that runs without a cycle (Mark()).
@@ -1991,8 +2101,9 @@ void GcIncremental_OnMarked()
 
 // The cluster walks (CLR_RT_HeapCluster::RecoverFromGC) rebuild every free list from scratch, passing each free run,
 // old free blocks included, through OnFree exactly once. The bitmap sweep, in their place, counts its runs in
-// ApplyFreeMask and clears their bits in ClearFreedBits. Nothing else frees in a collection (event blocks that
-// RecoverEventsFromGC releases go to the event cache, not the free list).
+// ApplyFreeMask and clears their bits in ClearFreedBits; a cluster it sends to the header sweep goes through OnFree.
+// Nothing else frees in a collection (event blocks that RecoverEventsFromGC releases go to the event cache, not the
+// free list).
 bool GcIncremental_OnSweepHeap()
 {
     NATIVE_PROFILE_CLR_CORE();
@@ -2004,14 +2115,15 @@ bool GcIncremental_OnSweepHeap()
     s_cycle.heapNs = NowNs();
 
     // Only an incremental cycle's own collection, with its live bitmap still published (verify mode unpublishes it).
-    if (g_GcIncremental_LiveBits == nullptr || s_headerSweep || s_bitmapSweepVeto)
+    if (g_GcIncremental_LiveBits == nullptr || s_headerSweep || s_vetoCount > c_vetoSlots)
     {
         return false;
     }
 
-    s_bitmapSwept = SweepFromBitmaps();
+    SweepFromBitmaps();
+    s_bitmapSwept = true;
 
-    return s_bitmapSwept;
+    return true;
 }
 
 bool GcIncremental_ApplySweptFree()
