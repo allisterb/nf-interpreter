@@ -6,7 +6,8 @@
 // Hooks for an incremental, snapshot-at-the-beginning (Yuasa) collector. Compiled in only when
 // NANOCLR_GC_INCREMENTAL is defined (targets/posix: NANO_POSIX_GC_INCREMENTAL); otherwise every macro below
 // expands to nothing, so call sites take no semicolon. NANOCLR_GC_ON_SWEEP_HEAP() expands to an `if` guarding the
-// block that follows it. Rationale and the store-site audit behind each hook:
+// block that follows it; NANOCLR_GC_ON_ALLOCATION_FAILED() returns from the caller with the block it found. Rationale
+// and the store-site audit behind each hook:
 // qflat docs/internal/agent/tasks/0002-incremental-gc-spike.md.
 
 #ifndef NANOCLR_GCINCREMENTAL_H
@@ -27,10 +28,10 @@ extern __attribute__((visibility("hidden"))) bool g_GcIncremental_BarrierActive;
 extern bool g_GcIncremental_BarrierActive;
 #endif
 
-// Live bitmap of the incremental cycle being swept, or null. Published from the end of the final pause until Sweep()
-// returns (verify mode unpublishes it earlier, after copying it into HB_Alive), so MarkWeak() and Sweep() read the
-// cycle's mark through IsAlive() instead of a heap walk copying it into HB_Alive. Bit i covers the block at
-// g_GcIncremental_LiveBase + i blocks.
+// Live bitmap of the incremental cycle being swept, or null. Published from the end of the final pause's mark until
+// the last heap cluster is swept, which can be after the pause (verify mode unpublishes it earlier, after copying it
+// into HB_Alive), so MarkWeak() and the sweep read the cycle's mark through IsAlive() instead of a heap walk copying it
+// into HB_Alive. Bit i covers the block at g_GcIncremental_LiveBase + i blocks.
 #if defined(__GNUC__)
 extern __attribute__((visibility("hidden"))) const CLR_UINT32 *g_GcIncremental_LiveBits;
 extern __attribute__((visibility("hidden"))) uintptr_t g_GcIncremental_LiveBase;
@@ -83,24 +84,32 @@ void GcIncremental_OnFullMark();
 // Mark() has finished: verify mode checks its result here.
 void GcIncremental_OnMarked();
 // Sweep() is about to rebuild the free lists: from here to OnSwept, every free run is counted. After an incremental
-// cycle it rebuilds them from the bitmaps and returns true, walking the headers of any cluster whose bitmaps fail a
-// check; it returns false when the cluster walks must run for the whole heap.
+// cycle it returns true and rebuilds them from the bitmaps one heap cluster at a time, walking the headers of any
+// cluster whose bitmaps fail a check. The clusters are swept after the pause (OnQuantum, OnAllocationFailed, or at once
+// before a collection, compaction or the next cycle), or here with NANOCLR_GC_INCREMENTAL_SWEEP_US=0. It returns false
+// when the cluster walks must run for the whole heap.
 bool GcIncremental_OnSweepHeap();
-// Sweep() has finished: an incremental cycle's live bitmap is retired here, and its "[GCC]" line kept for OnQuantum.
+// Sweep() has finished: an incremental cycle's live bitmap is retired and its "[GCC]" line kept for OnQuantum, here or
+// when the sweep ends after the pause.
 void GcIncremental_OnSwept();
 // In place of Heap_ComputeAliveVsDeadRatio() after a sweep: sets m_totalBytes and m_freeBytes from the free runs the
-// sweep counted, instead of walking every free-list node. Returns false (the caller walks) if no count is available.
+// sweep counted, instead of walking every free-list node; a sweep continuing after the pause sets them when it ends.
+// Returns false (the caller walks) if no count is available.
 bool GcIncremental_ApplySweptFree();
+// An allocation found no free block (outside a collection): sweeps the clusters an incremental sweep has not reached
+// yet, trying an object allocation in each as it is swept (an event allocation, once all are swept, back to front as
+// the allocator does). Returns the block, or null.
+CLR_RT_HeapBlock *GcIncremental_OnAllocationFailed(CLR_UINT32 dataType, CLR_UINT32 flags, CLR_UINT32 length);
 
 // Incremental cycle. FinishCycle runs in place of Mark() in a full collection: with a cycle active it completes the
 // cycle's mark (drain, finalizer pass, publishing g_GcIncremental_LiveBits) and returns true. It returns false, and
 // Mark() runs, when no cycle is active, the cycle lost a grey push, or the collection is not the cycle's own final
 // pause (GC.Collect or an allocation failure mid-cycle discards the cycle for the exact stop-the-world result).
 bool GcIncremental_FinishCycle();
-// A thread quantum has ended: print the last cycle's pending "[GCC]" line, then start a cycle, run a mark slice, or
-// request the final pause.
+// A thread quantum has ended: print the last cycle's pending "[GCC]" line, then run a sweep step, start a cycle, run a
+// mark slice, or request the final pause.
 void GcIncremental_OnQuantum();
-// Heap compaction is about to move objects: abort any active cycle.
+// Heap compaction is about to move objects: abort any active cycle, and finish any sweep.
 void GcIncremental_OnCompaction();
 
 #define NANOCLR_GC_PRE_WRITE(slot)                                                                                     \
@@ -160,6 +169,13 @@ void GcIncremental_OnCompaction();
             Heap_ComputeAliveVsDeadRatio();                                                                            \
         }                                                                                                              \
     }
+#define NANOCLR_GC_ON_ALLOCATION_FAILED(hb, dataType, flags, length)                                                   \
+    {                                                                                                                  \
+        if (((hb) = GcIncremental_OnAllocationFailed(dataType, flags, length)) != nullptr)                             \
+        {                                                                                                              \
+            return hb;                                                                                                 \
+        }                                                                                                              \
+    }
 
 #else
 
@@ -183,6 +199,7 @@ void GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_COMPACTION()
 #define NANOCLR_GC_MARK()                        Mark();
 #define NANOCLR_GC_COMPUTE_ALIVE_VS_DEAD_RATIO() Heap_ComputeAliveVsDeadRatio();
+#define NANOCLR_GC_ON_ALLOCATION_FAILED(hb, dataType, flags, length)
 
 #endif // NANOCLR_GC_INCREMENTAL
 

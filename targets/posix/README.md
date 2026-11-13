@@ -113,6 +113,9 @@ IPv4 addresses exposed by the managed snapshot.
   - `heap_bytes` is the sum of the heap clusters' payloads, a little less than the heap size.
   - On a `compact` line, `used_bytes` and `heap_bytes` are as of the last collection, which may be
     well before the compaction.
+  - On the `gc` line of an incremental cycle's final pause whose sweep continues after the pause,
+    `used_bytes` is still the previous collection's; the cycle's `[GCC]` line has the value at the
+    end of its sweep.
   - On QNX x86_64, `ClockCycles()` reads the TSC. If the CPUs' TSCs are not synchronised (possible
     under some hypervisors), a thread that moves between CPUs can record a wrapped, huge duration.
     Pin the process to one CPU if that happens.
@@ -152,13 +155,27 @@ IPv4 addresses exposed by the managed snapshot.
     objects (default 4096). This is a soft target: an object is scanned whole, except that
     reference arrays longer than 1024 elements are scanned in chunks.
   - **Finish:** when no grey work is left, a full collection runs with the cycle's mark in place of
-    the stop-the-world mark. The sweep is still stop-the-world.
-  - **Bitmap sweep:** that collection rebuilds the free lists from the bitmaps instead of walking
-    every block header. The bitmaps hold object starts, event-block starts and block ends, and the
-    collection writes only the first header of each free run.
-    - It sweeps one heap cluster (about 1.5 MiB) at a time, checking that cluster's bitmaps against
-      themselves before writing any of its memory. A cluster whose bitmaps disagree falls back to
-      the header walk on its own, printing `[GCS] self-check: ...` and
+    the stop-the-world mark. That final pause no longer sweeps the heap: it starts the sweep.
+  - **Bitmap sweep:** the free lists are rebuilt from the bitmaps instead of walking every block
+    header. The bitmaps hold object starts, event-block starts and block ends, and the sweep writes
+    only the first header of each free run.
+    - It sweeps one heap cluster (about 1.5 MiB) at a time, after the final pause:
+      - at each quantum boundary for up to `NANOCLR_GC_INCREMENTAL_SWEEP_US` microseconds (default
+        100, at least one cluster). `0` sweeps the whole heap inside the final pause instead;
+      - on a failed allocation, before the allocator would collect: cluster by cluster for an
+        object, trying it in each one swept; all of them for an event block, which then goes back
+        to front as usual;
+      - all at once (a forced finish) before anything that needs the whole heap swept: a
+        collection, a compaction, or the next cycle's start. In GC-stress mode a cycle is not
+        started from the allocator while a sweep runs.
+
+      Until a cluster is swept, the mutator allocates from its old free list. Such a block gets a
+      live bit, which keeps it through that cluster's sweep. While all threads wait, no quantum
+      boundary runs, so the sweep waits too. A heap dump (`Profiler::DumpHeap`) taken meanwhile
+      lists the dead objects of unswept clusters, whose references may point into reused memory.
+    - Each cluster's bitmaps are checked against themselves before any of its memory is written.
+      A cluster whose bitmaps disagree falls back to the header walk on its own, printing
+      `[GCS] self-check: ...` and
       `[GCS] run=... cluster at slot ...: ...; header sweep instead`. So does a cluster holding a
       block marked alive that is not an object start; if there are more than 8 of those, or one
       off the block grid, the whole collection uses the header walk.
@@ -173,7 +190,12 @@ IPv4 addresses exposed by the managed snapshot.
       walk would free, cluster by cluster. Any disagreement other than such blocks is printed
       (`[GCS] split: ...`, `kept-dead` or `freed-live`) and that cluster takes the header walk
       instead. `strays_freed`, `orphans_kept` and `alive_kept` count only the clusters the bitmap
-      sweep kept; `free_blocks` counts the free blocks of every cluster. Each collection then prints:
+      sweep kept; `free_blocks` counts the free blocks of every cluster. At the end of each sweep,
+      the cycle bitmaps must be clear, each cluster's header walk must end at its payload end, and
+      its free list must be address-ordered free blocks carrying no bits. Any failure prints
+      `[GCS] sweep check: ...`. The free lists must also hold what the sweep counted, less what was
+      allocated from swept clusters since; otherwise it prints `[GCI] free count mismatch ...`.
+      Each sweep then prints:
 
       ```text
       [GCS] run=12 runs=... free_blocks=... dead_objects=... strays_freed=... orphans_kept=0 alive_kept=0 fallback_clusters=0
@@ -210,27 +232,39 @@ IPv4 addresses exposed by the managed snapshot.
       aborts the cycle. That collection is a stop-the-world one, which costs far more than the print.
 
     ```text
-    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=... fallback_clusters=...
+    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=... fallback_clusters=... sweep_steps=... step_max_us=... sweep_span_ms=... swept_on_alloc=... forced=none forced_clusters=0 forced_us=0 used_bytes=...
     ```
 
     - `final_mark_us` is the final pause's marking: draining what is still grey, the finalizer
       pass, and `live_us`, which publishes the live bitmap. Objects allocated during the cycle are
       marked as they are allocated, so `live_us` is close to 0.
-    - `sweep_us` is the rest of the final pause: weak references and the sweep, which reads
-      liveness from the live bitmap rather than from a heap walk that copies it into `HB_Alive`.
-      With `NANOCLR_GC_VERIFY=1` it includes verify mode's second mark.
+    - `sweep_us` is the rest of the final pause: weak references and the sweep's part in the pause,
+      which reads liveness from the live bitmap rather than from a heap walk that copies it into
+      `HB_Alive`. With `NANOCLR_GC_VERIFY=1` it includes verify mode's second mark.
     - `sweep_us` splits into `pre_us` (verify mode's second mark, weak references and
-      `RecoverEventsFromGC`), `heap_us` (the heap sweep) and `post_us` (clearing the cycle's
-      bitmaps). For a bitmap sweep, `heap_us` splits further into `clear_us` (the scratch bitmap),
-      `mask_us` (every cluster's free mask and its self-check, plus the shadow check under barrier
-      stress) and `apply_us` (the rest: for each cluster, clearing the freed slots' start, event and
-      end bits in one pass over its bitmap words, then writing the free runs, or the header walk for
-      a cluster that fell back; plus the `[GCS]` lines), with the `free_runs` the bitmap sweep
-      wrote, the `dead_objects` it freed, and the `fallback_clusters` that took the header walk.
-      `clear_us`, `mask_us`, `apply_us`, `free_runs`, `dead_objects` and `fallback_clusters` are 0
-      after a header walk. Each part is truncated to whole microseconds on its own, so the parts can
-      add up to a microsecond or two less than the whole.
-    - `total_ms` runs from the initial pause to the end of the sweep.
+      `RecoverEventsFromGC`), `heap_us` (the heap sweep's part in the pause: close to 0 unless
+      `NANOCLR_GC_INCREMENTAL_SWEEP_US=0` or a header walk) and `post_us` (clearing the cycle's
+      bitmaps after a header walk).
+    - The bitmap sweep's work, summed over its clusters wherever they were swept and measured with
+      stats on: `mask_us` (every cluster's free mask and its self-check, plus the shadow check
+      under barrier stress), `apply_us` (clearing the freed slots' start, event and end bits in one
+      pass over the cluster's bitmap words, then writing the free runs, or the header walk for a
+      cluster that fell back) and `clear_us` (clearing the cluster's range of the cycle bitmaps).
+      With the `free_runs` it wrote, the `dead_objects` it freed, and the `fallback_clusters` that
+      took the header walk. These are 0 after a header walk. Each part is truncated to whole
+      microseconds on its own, so the parts can add up to a microsecond or two less than the whole.
+    - After the pause: `sweep_steps` quantum-boundary steps, the longest of them or of a failed
+      allocation's sweeping (`step_max_us`), `sweep_span_ms` from the end of the pause to the last
+      cluster swept, and `swept_on_alloc` clusters swept by failed allocations.
+    - `forced` names what made the rest of the sweep finish at once (`collection`, `compaction`,
+      `cycle` or a failed `event` allocation), with the `forced_clusters` it swept and `forced_us`
+      it took; `none` if nothing did.
+    - `used_bytes` is the heap in use when a sweep after the pause ends, and 0 when the sweep ended
+      in the pause (the `[GCT]` line is exact then).
+    - The line is kept when the sweep ends and printed at the next quantum boundary.
+    - `total_ms` runs from the initial pause to the end of the sweep, wherever it ends.
+    - Free memory (`m_freeBytes`) stays at the previous collection's value until the sweep ends,
+      then counts every cluster's free runs less what was allocated from swept clusters since.
     - `bitmap_sweep` is 1 when the bitmap sweep ran, even if some clusters fell back, and 0 when
       the header walk did for the whole heap.
     - `final_scanned` counts the objects still grey at that point. It is 0 when the slices kept up.

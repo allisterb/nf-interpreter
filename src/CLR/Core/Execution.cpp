@@ -2175,6 +2175,8 @@ CLR_RT_HeapBlock *CLR_RT_ExecutionEngine::ExtractHeapBlocks(
             }
 
             m_lastHcUsed = nullptr;
+
+            NANOCLR_GC_ON_ALLOCATION_FAILED(hb, dataType, flags, length)
         }
 
         if (flags & CLR_RT_HeapBlock::HB_NoGcOnFailedAllocation)
