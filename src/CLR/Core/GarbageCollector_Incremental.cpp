@@ -142,7 +142,8 @@ const size_t c_arrayChunk = 1024;              // reference arrays longer than t
 const CLR_UINT32 c_verifyReportedMisses = 5;   // misses printed in detail per collection
 const CLR_UINT32 c_verifyReportedFloating = 3; // floating objects printed in detail per collection
 const CLR_UINT32 c_sweepReportedErrors = 5;    // bitmap-sweep disagreements printed in detail per collection
-const size_t c_vetoSlots = 8;                  // veto slots kept per collection before every cluster is vetoed
+const size_t c_noBit = (size_t)-1;
+const size_t c_vetoSlots = 8; // veto slots kept per collection before every cluster is vetoed
 
 // The bitmap sweep writes free-run headers only, so it is built only when no heap debugging needs every dead block
 // visited (CLR_RT_HeapCluster::RecoverFromGC: early-collection tracing, allocation profiling, heap validation).
@@ -722,16 +723,45 @@ void ClearCycleBitmaps()
     memset(s_allocated, 0, BitmapWords() * sizeof(*s_allocated));
 }
 
-// Initial pause: snapshot the roots and turn the barrier on. Never while the last cycle's sweep runs.
+// First slot set in s_marked or s_allocated (a padding bit past s_slots counts), or c_noBit.
+size_t FirstCycleBit()
+{
+    for (size_t w = 0; w < BitmapWords(); w++)
+    {
+        if ((s_marked[w] | s_allocated[w]) != 0)
+        {
+            return w * c_bitsPerWord + (size_t)__builtin_ctz(s_marked[w] | s_allocated[w]);
+        }
+    }
+
+    return c_noBit;
+}
+
+// Initial pause: snapshot the roots and turn the barrier on. Never while the last cycle's sweep runs. The cycle
+// bitmaps are already clear: only a cycle and its sweep set bits in them, and every way out of one clears them (the
+// bitmap sweep cluster by cluster, a header sweep in OnSwept, an abort in EndCycle, the nested-collection error in
+// OnFullMark, RebuildStarts at heap init and compaction). A stale mark bit would make Shade skip an object, so stress
+// mode checks this here.
 void StartCycle()
 {
     _ASSERTE(!s_sweeping);
+
+    const size_t stale = s_stress ? FirstCycleBit() : c_noBit;
+
+    if (stale != c_noBit)
+    {
+        CLR_Debug::Printf(
+            "[GCS] sweep check: cycle bit left at the start of cycle %u at slot=%u run=%u (last cycle's run)\r\n",
+            (unsigned)(s_cycleCount + 1),
+            (unsigned)stale,
+            (unsigned)s_cycle.run);
+        ClearCycleBitmaps();
+    }
 
     s_cycle = {};
     s_cycle.startNs = NowNs();
     s_cycleCount++;
 
-    ClearCycleBitmaps();
     s_greyCount = 0;
     s_partialArray = nullptr;
     s_greyOverflow = false;
@@ -1661,13 +1691,9 @@ void CheckSweptHeap()
     };
     auto blockBits = [](size_t w) { return s_starts[w] | s_events[w] | s_ends[w]; };
 
-    for (size_t w = 0; w < BitmapWords(); w++)
+    if (const size_t stale = FirstCycleBit(); stale != c_noBit)
     {
-        if ((s_marked[w] | s_allocated[w]) != 0)
-        {
-            report("cycle bit left", w * c_bitsPerWord + (size_t)__builtin_ctz(s_marked[w] | s_allocated[w]));
-            break;
-        }
+        report("cycle bit left", stale);
     }
 
     NANOCLR_FOREACH_NODE(CLR_RT_HeapCluster, hc, g_CLR_RT_ExecutionEngine.m_heap)
@@ -2635,11 +2661,11 @@ void GcIncremental_OnFullMark()
     }
 
     // With a cycle active, this collection is its final pause (GcIncremental_FinishCycle), which needs the grey stack
-    // and the bitmaps. Otherwise any barrier work (stress mode) is simply discarded.
+    // and the bitmaps. Otherwise any barrier work (stress mode) is simply discarded; the cycle bitmaps are already
+    // clear (see StartCycle).
     if (!s_cycleActive)
     {
         s_greyCount = 0;
-        memset(s_allocated, 0, BitmapWords() * sizeof(*s_allocated));
     }
 }
 
