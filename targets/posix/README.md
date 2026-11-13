@@ -261,13 +261,14 @@ IPv4 addresses exposed by the managed snapshot.
       took the header walk. These are 0 after a header walk. Each part is truncated to whole
       microseconds on its own, so the parts can add up to a microsecond or two less than the whole.
     - After the pause: `sweep_steps` quantum-boundary steps, the longest of them or of a failed
-      allocation's sweeping (`step_max_us`), `sweep_span_ms` from the end of the pause to the last
-      cluster swept, and `swept_on_alloc` clusters swept by failed allocations.
+      allocation's step (`step_max_us`), `sweep_span_ms` from the end of the pause to the last
+      cluster swept, and `swept_on_alloc`, the failed allocations swept as a step.
     - `catchup_steps` counts the steps at the catch-up budget, and `trigger_wait_us` is the time
       from the next cycle's trigger to the sweep's end (0 if the trigger did not fire mid-sweep).
-    - `forced` names what made the rest of the sweep finish at once (`collection`, `compaction` or
-      a failed `event` allocation), with the `forced_clusters` it swept and `forced_us` it took;
-      `none` if nothing did.
+    - `forced` names what last made several clusters be swept at once: `collection`, `compaction`,
+      a failed `event` allocation, or a failed object `allocation` that swept the rest of the heap
+      without finding room, or took longer than a catch-up step. Any other failed allocation is a
+      sweep step. `forced_clusters` and `forced_us` sum all of them; `none` if nothing did.
     - `used_bytes` is the heap in use when a sweep after the pause ends, and 0 when the sweep ended
       in the pause (the `[GCT]` line is exact then).
     - The line is kept when the sweep ends and printed at the next quantum boundary.

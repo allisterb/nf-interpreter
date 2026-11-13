@@ -86,9 +86,10 @@ struct GcIncrementalCycle
     uint64_t startNs;
     uint64_t initialNs;   // initial pause: root snapshot
     uint64_t sliceMaxNs;  // longest mark slice
-    uint64_t finalNs;     // final pause, mark part: drain, finalizer pass, live bitmap (sweep not included)
+    uint64_t finalNs;     // final pause, mark part: drain, finalizer pass, live bitmap
     uint64_t liveNs;      // publishing the live bitmap (s_marked)
-    uint64_t markedEndNs; // end of the mark part; the rest of the final pause is MarkWeak and the sweep
+    uint64_t markedEndNs; // end of the mark part; the rest of the pause is weak references, RecoverEventsFromGC and
+                          // the sweep's part in the pause
     uint64_t heapNs;      // the heap sweep starts (after verify's mark, MarkWeak, weak delegates, RecoverEventsFromGC)
     uint64_t sweptNs;     // OnSwept: the final pause's part of the heap sweep ends
     uint64_t pauseEndNs;  // OnSwept done: the final pause's sweep part is over
@@ -99,19 +100,19 @@ struct GcIncrementalCycle
     uint64_t maskNs;
     uint64_t applyNs;
     uint64_t clearNs;
-    uint64_t stepMaxNs;     // longest sweep step after the pause (a quantum boundary's, or one failed allocation's)
-    uint64_t forcedNs;      // the forced finish
-    uint64_t triggerNs;     // the next cycle's trigger fired while this sweep ran (0 if it did not)
-    const char *forced;     // what forced the rest of the sweep to finish at once, or null
-    CLR_UINT32 run;         // the final pause's collection number
-    CLR_UINT32 usedBytes;   // heap in use when a sweep after the pause ends; 0 if the sweep ended in the pause
-    CLR_UINT32 freeRuns;    // bitmap sweep: free runs written
-    CLR_UINT32 deadObjects; // bitmap sweep: dead objects freed
+    uint64_t stepMaxNs;          // longest sweep step after the pause (at a quantum boundary, or a failed allocation's)
+    uint64_t forcedNs;           // forced finishes, summed
+    uint64_t triggerNs;          // the next cycle's trigger fired while this sweep ran (0 if it did not)
+    const char *forced;          // what last forced several clusters to be swept at once, or null
+    CLR_UINT32 run;              // the final pause's collection number
+    CLR_UINT32 usedBytes;        // heap in use when a sweep after the pause ends; 0 if the sweep ended in the pause
+    CLR_UINT32 freeRuns;         // bitmap sweep: free runs written
+    CLR_UINT32 deadObjects;      // bitmap sweep: dead objects freed
     CLR_UINT32 fallbackClusters; // bitmap sweep: clusters that took the header sweep instead
     CLR_UINT32 sweepSteps;       // sweep steps at quantum boundaries
     CLR_UINT32 catchupSteps;     // of those, steps at the catch-up budget, the next cycle's trigger having fired
-    CLR_UINT32 sweptOnAlloc;     // clusters swept by failed allocations
-    CLR_UINT32 forcedClusters;   // clusters swept by the forced finish
+    CLR_UINT32 sweptOnAlloc;     // failed allocations that swept as a step (not as a forced finish)
+    CLR_UINT32 forcedClusters;   // clusters swept by forced finishes
     CLR_UINT32 slices;
     CLR_UINT32 rootBlocks;
     CLR_UINT32 scannedObjects;
@@ -879,7 +880,8 @@ void PrintReport(const GcIncrementalReport &r)
 
 // GC-stress mode (NANOCLR_GC_INCREMENTAL_STRESS=N), every N object allocations, from inside the allocator: start a
 // cycle, or run one slice. The final pause is left to the next quantum boundary, never run inside the allocator, and so
-// is the sweep: a new cycle waits until the quantum boundaries have swept the last one.
+// is the sweep: a new cycle waits until the last one is swept (at quantum boundaries, on a failed allocation from
+// ExtractHeapBlocks, or by a forced finish).
 void StressStep()
 {
     if (!s_incremental || g_CLR_RT_ExecutionEngine.m_heapState == CLR_RT_ExecutionEngine::c_HeapState_UnderGC)
@@ -1813,6 +1815,14 @@ void EndSweep()
     QueueReport();
 }
 
+// A sweep can be forced more than once (a failed allocation, then a collection): the totals add up.
+void RecordForced(const char *reason, CLR_UINT32 clusters, uint64_t ns)
+{
+    s_cycle.forced = reason;
+    s_cycle.forcedClusters += clusters;
+    s_cycle.forcedNs += ns;
+}
+
 // Sweeps every cluster left, at once.
 void FinishSweep(const char *reason)
 {
@@ -1824,9 +1834,7 @@ void FinishSweep(const char *reason)
         clusters++;
     }
 
-    s_cycle.forced = reason;
-    s_cycle.forcedClusters = clusters;
-    s_cycle.forcedNs = NowNs() - start;
+    RecordForced(reason, clusters, NowNs() - start);
     EndSweep();
 }
 
@@ -2358,7 +2366,7 @@ void GcIncremental_OnQuantum()
 
         if (s_sweeping)
         {
-            // The new cycle reuses the sweep's bitmaps: it starts at the first quantum boundary after the sweep ends.
+            // The new cycle reuses the sweep's bitmaps: it starts at the quantum boundary where the sweep ends.
             if (start)
             {
                 if (s_cycle.triggerNs == 0)
@@ -2447,6 +2455,7 @@ CLR_RT_HeapBlock *GcIncremental_OnAllocationFailed(CLR_UINT32 dataType, CLR_UINT
 
     // Every cluster swept so far was already tried, so try each one only once it is swept.
     const uint64_t start = NowNs();
+    CLR_UINT32 clusters = 0;
     bool more = true;
 
     while (hb == nullptr && more)
@@ -2454,7 +2463,7 @@ CLR_RT_HeapBlock *GcIncremental_OnAllocationFailed(CLR_UINT32 dataType, CLR_UINT
         CLR_RT_HeapCluster *hc = s_sweepCursor;
 
         more = SweepCluster();
-        s_cycle.sweptOnAlloc++;
+        clusters++;
         hb = hc->ExtractBlocks(dataType, flags, length);
 
         if (hb != nullptr)
@@ -2465,9 +2474,19 @@ CLR_RT_HeapBlock *GcIncremental_OnAllocationFailed(CLR_UINT32 dataType, CLR_UINT
 
     const uint64_t elapsed = NowNs() - start;
 
-    if (elapsed > s_cycle.stepMaxNs)
+    // A forced finish if it swept to the end in vain or overran a catch-up step; otherwise a sweep step.
+    if ((hb == nullptr && clusters > 1) || elapsed > s_sweepCatchupNs)
     {
-        s_cycle.stepMaxNs = elapsed;
+        RecordForced("allocation", clusters, elapsed);
+    }
+    else
+    {
+        s_cycle.sweptOnAlloc++;
+
+        if (elapsed > s_cycle.stepMaxNs)
+        {
+            s_cycle.stepMaxNs = elapsed;
+        }
     }
 
     if (!more)
