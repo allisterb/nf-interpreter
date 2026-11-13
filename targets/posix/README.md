@@ -161,13 +161,20 @@ IPv4 addresses exposed by the managed snapshot.
     only the first header of each free run.
     - It sweeps one heap cluster (about 1.5 MiB) at a time, after the final pause:
       - at each quantum boundary for up to `NANOCLR_GC_INCREMENTAL_SWEEP_US` microseconds (default
-        100, at least one cluster). `0` sweeps the whole heap inside the final pause instead;
+        100). A step sweeps at least one cluster, then another only while one as long as the last
+        would still fit. `0` sweeps the whole heap inside the final pause instead;
+      - once the next cycle's trigger has fired, at each quantum boundary for up to
+        `NANOCLR_GC_INCREMENTAL_SWEEP_CATCHUP_US` (default 400, never below the normal budget). The
+        new cycle starts at the quantum boundary where the sweep ends, since it reuses the sweep's
+        bitmaps. Memory allocated while it waits isn't reclaimed before that cycle's sweep, so a long
+        wait leaves the cycle less headroom: on a 40 MiB heap, a 100 µs catch-up budget made about
+        44% of cycles abort into a stop-the-world collection;
       - on a failed allocation, before the allocator would collect: cluster by cluster for an
         object, trying it in each one swept; all of them for an event block, which then goes back
         to front as usual;
       - all at once (a forced finish) before anything that needs the whole heap swept: a
-        collection, a compaction, or the next cycle's start. In GC-stress mode a cycle is not
-        started from the allocator while a sweep runs.
+        collection or a compaction. In GC-stress mode a cycle is not started from the allocator
+        while a sweep runs.
 
       Until a cluster is swept, the mutator allocates from its old free list. Such a block gets a
       live bit, which keeps it through that cluster's sweep. While all threads wait, no quantum
@@ -232,7 +239,7 @@ IPv4 addresses exposed by the managed snapshot.
       aborts the cycle. That collection is a stop-the-world one, which costs far more than the print.
 
     ```text
-    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=... fallback_clusters=... sweep_steps=... step_max_us=... sweep_span_ms=... swept_on_alloc=... forced=none forced_clusters=0 forced_us=0 used_bytes=...
+    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=... fallback_clusters=... sweep_steps=... step_max_us=... sweep_span_ms=... swept_on_alloc=... catchup_steps=... trigger_wait_us=... forced=none forced_clusters=0 forced_us=0 used_bytes=...
     ```
 
     - `final_mark_us` is the final pause's marking: draining what is still grey, the finalizer
@@ -256,9 +263,11 @@ IPv4 addresses exposed by the managed snapshot.
     - After the pause: `sweep_steps` quantum-boundary steps, the longest of them or of a failed
       allocation's sweeping (`step_max_us`), `sweep_span_ms` from the end of the pause to the last
       cluster swept, and `swept_on_alloc` clusters swept by failed allocations.
-    - `forced` names what made the rest of the sweep finish at once (`collection`, `compaction`,
-      `cycle` or a failed `event` allocation), with the `forced_clusters` it swept and `forced_us`
-      it took; `none` if nothing did.
+    - `catchup_steps` counts the steps at the catch-up budget, and `trigger_wait_us` is the time
+      from the next cycle's trigger to the sweep's end (0 if the trigger did not fire mid-sweep).
+    - `forced` names what made the rest of the sweep finish at once (`collection`, `compaction` or
+      a failed `event` allocation), with the `forced_clusters` it swept and `forced_us` it took;
+      `none` if nothing did.
     - `used_bytes` is the heap in use when a sweep after the pause ends, and 0 when the sweep ended
       in the pause (the `[GCT]` line is exact then).
     - The line is kept when the sweep ends and printed at the next quantum boundary.

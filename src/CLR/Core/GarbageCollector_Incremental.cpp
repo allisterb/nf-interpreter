@@ -44,9 +44,10 @@
 // exact result. Weak delegate lists are traced as strong during a cycle, so while cycles keep running their targets are
 // collected only by a collection that runs without one. Compaction aborts a cycle, as does a lost grey push (the final
 // pause then runs Mark()). A finished cycle's sweep rebuilds the free lists from the bitmaps, one heap cluster at a
-// time (SweepCluster), after the final pause: at quantum boundaries within NANOCLR_GC_INCREMENTAL_SWEEP_US, on a failed
-// allocation, and all at once before anything that needs the whole heap swept (a collection, compaction, the next
-// cycle). A cluster whose bitmaps fail their self-check walks its headers instead. With
+// time (SweepCluster), after the final pause: at quantum boundaries within NANOCLR_GC_INCREMENTAL_SWEEP_US (or
+// NANOCLR_GC_INCREMENTAL_SWEEP_CATCHUP_US once the next cycle's trigger has fired; that cycle starts when the sweep
+// ends), on a failed allocation, and all at once before a collection, compaction or event allocation that finds no
+// room. A cluster whose bitmaps fail their self-check walks its headers instead. With
 // NANOCLR_GC_INCREMENTAL_STATS=1 each finished cycle prints one "[GCC]" line, at the next quantum boundary so that the
 // print is not part of the pause. GC-stress mode (NANOCLR_GC_INCREMENTAL_STRESS=N) also starts a cycle or runs a slice
 // every N object allocations, from inside the allocator, so marking interleaves with native code as well as with IL.
@@ -100,6 +101,7 @@ struct GcIncrementalCycle
     uint64_t clearNs;
     uint64_t stepMaxNs;     // longest sweep step after the pause (a quantum boundary's, or one failed allocation's)
     uint64_t forcedNs;      // the forced finish
+    uint64_t triggerNs;     // the next cycle's trigger fired while this sweep ran (0 if it did not)
     const char *forced;     // what forced the rest of the sweep to finish at once, or null
     CLR_UINT32 run;         // the final pause's collection number
     CLR_UINT32 usedBytes;   // heap in use when a sweep after the pause ends; 0 if the sweep ended in the pause
@@ -107,6 +109,7 @@ struct GcIncrementalCycle
     CLR_UINT32 deadObjects; // bitmap sweep: dead objects freed
     CLR_UINT32 fallbackClusters; // bitmap sweep: clusters that took the header sweep instead
     CLR_UINT32 sweepSteps;       // sweep steps at quantum boundaries
+    CLR_UINT32 catchupSteps;     // of those, steps at the catch-up budget, the next cycle's trigger having fired
     CLR_UINT32 sweptOnAlloc;     // clusters swept by failed allocations
     CLR_UINT32 forcedClusters;   // clusters swept by the forced finish
     CLR_UINT32 slices;
@@ -222,8 +225,9 @@ CLR_UINT32 s_sweepFallbackCount;
 bool s_sweeping;
 CLR_RT_HeapCluster *s_sweepCursor; // next cluster to sweep
 size_t s_sweepCursorSlot;          // its first slot
-size_t s_sweepClearFrom;  // the previous cluster's end slot: the next cluster clears the cycle bitmaps from here
-uint64_t s_sweepBudgetNs; // NANOCLR_GC_INCREMENTAL_SWEEP_US per quantum boundary; 0 = sweep in the final pause
+size_t s_sweepClearFrom;   // the previous cluster's end slot: the next cluster clears the cycle bitmaps from here
+uint64_t s_sweepBudgetNs;  // NANOCLR_GC_INCREMENTAL_SWEEP_US per quantum boundary; 0 = sweep in the final pause
+uint64_t s_sweepCatchupNs; // NANOCLR_GC_INCREMENTAL_SWEEP_CATCHUP_US: the budget once the next cycle's trigger fired
 GcIncrementalShadowTotals s_shadow;
 
 uint64_t NowNs()
@@ -827,13 +831,11 @@ void PrintReport(const GcIncrementalReport &r)
     // sweep_us, the final pause after its mark, splits into pre_us (verify's mark, MarkWeak, weak delegates,
     // RecoverEventsFromGC), heap_us (the heap sweep's part in the pause) and post_us (clearing the cycle bitmaps after
     // a header sweep). clear_us, mask_us and apply_us sum the bitmap sweep's clusters wherever they were swept;
-    // sweep_span_ms is the time from the end of the pause to the last cluster swept.
+    // sweep_span_ms is the time from the end of the pause to the last cluster swept. Two prints: the posix Printf
+    // formats into 512 bytes, and a cut line loses its line end.
     CLR_Debug::Printf(
         "[GCC] cycle=%u run=%u slices=%u initial_us=%u slice_max_us=%u final_mark_us=%u live_us=%u sweep_us=%u "
-        "bitmap_sweep=%u total_ms=%u roots=%u scanned=%u slots=%u final_scanned=%u allocated_black=%u grey_max=%u "
-        "pre_us=%u heap_us=%u clear_us=%u mask_us=%u apply_us=%u post_us=%u free_runs=%u dead_objects=%u "
-        "fallback_clusters=%u sweep_steps=%u step_max_us=%u sweep_span_ms=%u swept_on_alloc=%u forced=%s "
-        "forced_clusters=%u forced_us=%u used_bytes=%u\r\n",
+        "bitmap_sweep=%u total_ms=%u roots=%u scanned=%u slots=%u final_scanned=%u allocated_black=%u grey_max=%u ",
         (unsigned)r.number,
         (unsigned)c.run,
         (unsigned)c.slices,
@@ -849,7 +851,11 @@ void PrintReport(const GcIncrementalReport &r)
         (unsigned)c.scannedSlots,
         (unsigned)c.finalScannedObjects,
         (unsigned)c.allocatedBlack,
-        (unsigned)c.greyMax,
+        (unsigned)c.greyMax);
+    CLR_Debug::Printf(
+        "pre_us=%u heap_us=%u clear_us=%u mask_us=%u apply_us=%u post_us=%u free_runs=%u dead_objects=%u "
+        "fallback_clusters=%u sweep_steps=%u step_max_us=%u sweep_span_ms=%u swept_on_alloc=%u catchup_steps=%u "
+        "trigger_wait_us=%u forced=%s forced_clusters=%u forced_us=%u used_bytes=%u\r\n",
         us(c.markedEndNs, c.heapNs),
         us(c.heapNs, c.sweptNs),
         phases ? (unsigned)(c.clearNs / 1000) : 0u,
@@ -863,6 +869,8 @@ void PrintReport(const GcIncrementalReport &r)
         (unsigned)(c.stepMaxNs / 1000),
         (unsigned)((endNs - c.pauseEndNs) / 1000000),
         (unsigned)c.sweptOnAlloc,
+        (unsigned)c.catchupSteps,
+        c.triggerNs != 0 ? us(c.triggerNs, endNs) : 0u,
         c.forced != nullptr ? c.forced : "none",
         (unsigned)c.forcedClusters,
         (unsigned)(c.forcedNs / 1000),
@@ -1822,18 +1830,24 @@ void FinishSweep(const char *reason)
     EndSweep();
 }
 
-// One sweep step after the final pause, at a quantum boundary: clusters until the budget is spent (at least one).
-void SweepStep()
+// One sweep step after the final pause, at a quantum boundary: at least one cluster, then another only while one as
+// long as the last would still fit the budget.
+void SweepStep(uint64_t budgetNs)
 {
     const uint64_t start = NowNs();
+    uint64_t now = start;
+    uint64_t last;
     bool more;
 
     do
     {
+        const uint64_t before = now;
         more = SweepCluster();
-    } while (more && NowNs() - start < s_sweepBudgetNs);
+        now = NowNs();
+        last = now - before;
+    } while (more && now - start + last <= budgetNs);
 
-    const uint64_t elapsed = NowNs() - start;
+    const uint64_t elapsed = now - start;
 
     s_cycle.sweepSteps++;
 
@@ -2222,16 +2236,22 @@ void GcIncremental_OnHeapInitialized()
         const char *sweepUs = getenv("NANOCLR_GC_INCREMENTAL_SWEEP_US");
         s_sweepBudgetNs = (sweepUs && sweepUs[0] != '\0' ? strtoul(sweepUs, nullptr, 10) : 100) * (uint64_t)1000;
 
+        // Never below the normal budget.
+        const char *catchupUs = getenv("NANOCLR_GC_INCREMENTAL_SWEEP_CATCHUP_US");
+        s_sweepCatchupNs = (catchupUs && catchupUs[0] != '\0' ? strtoul(catchupUs, nullptr, 10) : 400) * (uint64_t)1000;
+        s_sweepCatchupNs = s_sweepCatchupNs < s_sweepBudgetNs ? s_sweepBudgetNs : s_sweepCatchupNs;
+
         CLR_Debug::Printf(
             "[GCC] incremental on: trigger=%u slots slice=%u slots stress_every=%u allocations sweep=%s stats=%u "
-            "fallback_every=%u clusters sweep_us=%u\r\n",
+            "fallback_every=%u clusters sweep_us=%u catchup_us=%u\r\n",
             (unsigned)s_triggerSlots,
             (unsigned)s_sliceSlots,
             (unsigned)s_stressEvery,
             s_headerSweep ? "header" : "bitmap",
             (unsigned)s_cycleStats,
             (unsigned)s_sweepFallbackEvery,
-            (unsigned)(s_sweepBudgetNs / 1000));
+            (unsigned)(s_sweepBudgetNs / 1000),
+            (unsigned)(s_sweepCatchupNs / 1000));
     }
 }
 
@@ -2338,14 +2358,23 @@ void GcIncremental_OnQuantum()
 
         if (s_sweeping)
         {
-            if (!start)
+            // The new cycle reuses the sweep's bitmaps: it starts at the first quantum boundary after the sweep ends.
+            if (start)
             {
-                SweepStep();
-                return;
+                if (s_cycle.triggerNs == 0)
+                {
+                    s_cycle.triggerNs = NowNs();
+                }
+
+                s_cycle.catchupSteps++;
             }
 
-            // The new cycle's bitmaps are the sweep's live and scratch bitmaps.
-            FinishSweep("cycle");
+            SweepStep(start ? s_sweepCatchupNs : s_sweepBudgetNs);
+
+            if (s_sweeping)
+            {
+                return;
+            }
         }
 
         if (start)

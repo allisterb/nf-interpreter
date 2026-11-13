@@ -86,8 +86,8 @@ void GcIncremental_OnMarked();
 // Sweep() is about to rebuild the free lists: from here to OnSwept, every free run is counted. After an incremental
 // cycle it returns true and rebuilds them from the bitmaps one heap cluster at a time, walking the headers of any
 // cluster whose bitmaps fail a check. The clusters are swept after the pause (OnQuantum, OnAllocationFailed, or at once
-// before a collection, compaction or the next cycle), or here with NANOCLR_GC_INCREMENTAL_SWEEP_US=0. It returns false
-// when the cluster walks must run for the whole heap.
+// before a collection, compaction or failed event allocation), or here with NANOCLR_GC_INCREMENTAL_SWEEP_US=0. It
+// returns false when the cluster walks must run for the whole heap.
 bool GcIncremental_OnSweepHeap();
 // Sweep() has finished: an incremental cycle's live bitmap is retired and its "[GCC]" line kept for OnQuantum, here or
 // when the sweep ends after the pause.
