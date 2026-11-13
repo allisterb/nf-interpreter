@@ -13,6 +13,10 @@
 #include <nanoCLR_Runtime.h>
 #include <nanoHAL_v2.h>
 
+#if defined(NANOCLR_GC_TIMING)
+#include <nanoCLR_GcTiming.h>
+#endif
+
 namespace
 {
     std::mutex s_eventsMutex;
@@ -48,6 +52,9 @@ void Events_SetBoolTimer(bool *timerCompleteFlag, uint32_t millisecondsFromNow)
     }
 
     *timerCompleteFlag = false;
+#if defined(NANOCLR_GC_TIMING)
+    GcTiming_QuantumArmed(millisecondsFromNow);
+#endif
     const uint64_t myGen = s_boolTimerGeneration.load(std::memory_order_acquire);
 
     // Capture timerCompleteFlag directly in the lambda — never store it in a shared global.
@@ -62,6 +69,9 @@ void Events_SetBoolTimer(bool *timerCompleteFlag, uint32_t millisecondsFromNow)
             return;
         }
 
+#if defined(NANOCLR_GC_TIMING)
+        GcTiming_QuantumFired();
+#endif
         *timerCompleteFlag = true;
 
         // Wake up any Events_WaitForEvents call so the CLR can process the timer.

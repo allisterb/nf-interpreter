@@ -630,6 +630,35 @@ bool CLR_RT_Thread::FindEhBlock(
 
 //--//
 
+#if defined(NANOCLR_DEADLINE_QUANTUM)
+// A sleeper becomes ready only in ProcessTimer, between quanta, so end the quantum at the next timer or wait deadline
+// (ProcessTimer's cache) instead of up to 20 ms later. NANOCLR_DEADLINE_QUANTUM=0 restores fixed quanta.
+static CLR_UINT32 QuantumMilliseconds()
+{
+    static const bool enabled = [] {
+        const char *value = getenv("NANOCLR_DEADLINE_QUANTUM");
+        return value == nullptr || strcmp(value, "0") != 0;
+    }();
+    const CLR_RT_ExecutionEngine &ee = g_CLR_RT_ExecutionEngine;
+    const CLR_INT64 quantum = CLR_RT_Thread::c_TimeQuantum_Milliseconds * (CLR_INT64)TIME_CONVERSION__TO_MILLISECONDS;
+
+    if (!enabled || !ee.m_timerCache)
+    {
+        return CLR_RT_Thread::c_TimeQuantum_Milliseconds;
+    }
+
+    CLR_INT64 left = (CLR_INT64)ee.m_timerCacheNextTimeout - (CLR_INT64)HAL_Time_CurrentTime();
+    if (left >= quantum)
+    {
+        return CLR_RT_Thread::c_TimeQuantum_Milliseconds;
+    }
+
+    // Round up: waking early would only cost an extra boundary.
+    return left <= 0 ? 1
+                     : (CLR_UINT32)((left + TIME_CONVERSION__TO_MILLISECONDS - 1) / TIME_CONVERSION__TO_MILLISECONDS);
+}
+#endif
+
 HRESULT CLR_RT_Thread::Execute()
 {
     NATIVE_PROFILE_CLR_CORE();
@@ -658,7 +687,12 @@ HRESULT CLR_RT_Thread::Execute()
     _ASSERTE(!CLR_EE_DBG_IS(Stopped));
 #endif // #if defined(NANOCLR_ENABLE_SOURCELEVELDEBUGGING)
 
-    ::Events_SetBoolTimer((bool *)&m_timeQuantumExpired, CLR_RT_Thread::c_TimeQuantum_Milliseconds);
+#if defined(NANOCLR_DEADLINE_QUANTUM)
+    const CLR_UINT32 quantumMs = QuantumMilliseconds();
+#else
+    const CLR_UINT32 quantumMs = CLR_RT_Thread::c_TimeQuantum_Milliseconds;
+#endif
+    ::Events_SetBoolTimer((bool *)&m_timeQuantumExpired, quantumMs);
 
     while (m_timeQuantumExpired == false && !CLR_EE_DBG_IS(Stopped))
     {

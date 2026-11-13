@@ -10,6 +10,10 @@
 #include <inttypes.h>
 #include <stdint.h>
 
+#if defined(NANOCLR_GC_TIMING)
+#include <nanoCLR_GcTiming.h>
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static const CLR_INT64 c_MaximumTimeToActive = (TIME_CONVERSION__ONEMINUTE * TIME_CONVERSION__TO_SECONDS);
@@ -1718,10 +1722,17 @@ HRESULT CLR_RT_ExecutionEngine::ScheduleThreads(int maxContextSwitch)
 
         Watchdog_Reset();
 
+#if defined(NANOCLR_GC_TIMING)
+        uint64_t quantumStart = GcTiming_Now();
+#endif
         {
             // Runs the tread until expiration of its quantum or until thread is blocked.
             hr = th->Execute();
         }
+#if defined(NANOCLR_GC_TIMING)
+        uint64_t quantumReturned = GcTiming_Now();
+        bool quantumExpired = th->m_timeQuantumExpired;
+#endif
 
         if (FAILED(hr))
         {
@@ -1746,6 +1757,9 @@ HRESULT CLR_RT_ExecutionEngine::ScheduleThreads(int maxContextSwitch)
         NANOCLR_GC_ON_QUANTUM()
 
         (void)ProcessTimer();
+#if defined(NANOCLR_GC_TIMING)
+        GcTiming_ReportQuantum(quantumStart, quantumReturned, GcTiming_Now(), quantumExpired);
+#endif
     }
 
     NANOCLR_SET_AND_LEAVE(CLR_S_QUANTUM_EXPIRED);
@@ -3418,10 +3432,10 @@ bool CLR_RT_ExecutionEngine::IsTimeExpired(const CLR_INT64 &timeExpire, CLR_INT6
 {
     NATIVE_PROFILE_CLR_CORE();
 
-    if (timeExpire <= (CLR_INT64)HAL_Time_CurrentTime())
+    // One clock read: a second one could see the deadline pass and leave a non-positive timeoutMin.
+    CLR_INT64 diff = timeExpire - (CLR_INT64)HAL_Time_CurrentTime();
+    if (diff <= 0)
         return true;
-
-    CLR_INT64 diff = timeExpire - HAL_Time_CurrentTime();
 
     if (diff < timeoutMin)
     {

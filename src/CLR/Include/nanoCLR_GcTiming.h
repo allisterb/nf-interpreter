@@ -55,6 +55,13 @@ void GcTiming_ReportCollection(
 // usedBytes and heapBytes are as of the last collection: compaction does not update them.
 void GcTiming_ReportCompaction(uint32_t run, uint64_t start, uint64_t end, uint32_t usedBytes, uint32_t heapBytes);
 
+// Quantum timing. The target's quantum timer calls GcTiming_QuantumFired just before it sets the expired flag;
+// ScheduleThreads reports each thread run: start before Execute, returned after it, end after the quantum-boundary
+// work (GC quantum hook and ProcessTimer). expired is the thread's quantum flag when Execute returned.
+void GcTiming_QuantumArmed(uint32_t milliseconds); // on the CLR thread, when Execute arms the timer
+void GcTiming_QuantumFired();
+void GcTiming_ReportQuantum(uint64_t start, uint64_t returned, uint64_t end, bool expired);
+
 #endif // NANOCLR_GC_TIMING
 
 #endif // NANOCLR_GCTIMING_H

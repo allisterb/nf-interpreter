@@ -119,6 +119,65 @@ IPv4 addresses exposed by the managed snapshot.
   - On QNX x86_64, `ClockCycles()` reads the TSC. If the CPUs' TSCs are not synchronised (possible
     under some hypervisors), a thread that moves between CPUs can record a wrapped, huge duration.
     Pin the process to one CPU if that happens.
+  - Also prints a `[QNT]` line every 512 thread runs that ended because their quantum timer fired.
+    Times are in µs, as median/p99/max over the batch:
+
+    ```text
+    [QNT] batch=1 quanta=512 matched=512 deadline=102 short=103 last_emit_us=241 run_us=21026/34755/36760 timer_us=20984/24093/35776 timer_over_us=1049/4093/15776 notice_us=2/13764/15559 boundary_us=3/38/66 gap_us=0/0/241 short_boundary_us=3/30/80 short_gap_us=0/0/0
+    ```
+
+    (A stop-the-world, 40 MiB GC probe on a VMware QNX 8 VM, with deadline quanta: `nf_gcbench` run
+    `20261113-114626-dq40qnt`.)
+
+    - `run`: the start of `Execute` to the end of the quantum-boundary work.
+    - `deadline`: quanta armed for less than 20 ms, because a deadline was due
+      (`NANO_POSIX_DEADLINE_QUANTUM`).
+    - `timer`: the start of `Execute` to the quantum timer firing: the armed length (20 ms, or less
+      with `deadline`) plus the timer thread's wake-up latency.
+    - `timer_over`: that wake-up latency alone, the firing past the armed length. It includes
+      starting the per-quantum `std::thread`, sleep overshoot, and waiting for a CPU at the CLR
+      thread's priority.
+    - `notice`: the timer firing to `Execute` returning. The flag is checked at branches and
+      between frames and native calls, not per opcode. So this is the rest of the stretch without
+      a check, such as an allocation, including any GC that the allocation triggers.
+    - `boundary`: `Execute` returning to the end of `NANOCLR_GC_ON_QUANTUM()` and `ProcessTimer()`.
+    - `gap`: the previous run's end to this one's start. It covers work between runs:
+      - heap compaction, which runs outside `ScheduleThreads`;
+      - this batch line's own output, whose time is `last_emit_us` on the next line;
+      - idle waiting, when no thread was ready.
+    - `short`: all runs in the batch that ended before their quantum. `short_boundary` and
+      `short_gap` cover their first 512.
+    - `matched` counts quanta whose firing stamp fell inside the run; only those feed `timer`,
+      `timer_over` and `notice`. The timer can set the flag just after `Execute` cancelled it (an
+      upstream race), so a few short runs may count as expired with a `notice` near 0.
+    - `timer` and `notice` are measured across two threads. Unsynchronised TSCs bias them, but
+      pinning the process to one CPU puts the timer thread on the CLR thread's CPU, which inflates
+      `timer`.
+    - A sleeping thread moves to the ready list only in `ProcessTimer()`. While another thread is
+      busy, it wakes at the first quantum boundary after its deadline. It normally runs next,
+      because the ready list is ordered by execution counter. Its lateness is therefore the rest of
+      that `run` plus the gap before its own run, which is usually a `short_gap`. With
+      `NANO_POSIX_DEADLINE_QUANTUM`, that boundary is at the deadline, so the lateness is about
+      `timer_over` + `notice` + `boundary`.
+
+`NANO_POSIX_DEADLINE_QUANTUM`
+- Default: `ON`
+- Ends a thread's quantum at the next timer or wait deadline, rounded up to whole ms, instead of
+  after a fixed 20 ms. Those deadlines are `Thread.Sleep`, timed waits and managed `Timer`s, as
+  cached by `ProcessTimer()`.
+- Why: a sleeping thread becomes ready only between quanta, so with fixed quanta and another thread
+  busy, it woke up to 20 ms late.
+- The define is `NANOCLR_DEADLINE_QUANTUM`. At run time, the environment variable of the same name
+  set to `0` restores fixed quanta, so one binary can be compared both ways.
+- Limits:
+  - A deadline created by the running thread itself during its quantum (`Timer.Change`, a new
+    `Timer`, `ExecutionConstraint.Install`) is seen only at the end of that quantum, so the first callback can still be up to
+    20 ms late.
+  - Wake-up accuracy is still bounded by the host timer and by the next branch check.
+- Cost: shorter quanta mean more quantum boundaries. Each boundary costs one host thread for the
+  timer, a `ProcessTimer()` scan, and the incremental GC's per-boundary budget. A thread polling
+  with `Sleep(1)` gives every thread 1–2 ms quanta, so GC work at boundaries can take up to about
+  20× its usual share of the CPU.
 
 `NANO_POSIX_GC_HOST_MARK_STACK`
 - Default: `ON`

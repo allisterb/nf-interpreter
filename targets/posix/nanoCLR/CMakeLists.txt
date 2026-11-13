@@ -352,6 +352,10 @@ if(NANO_POSIX_GC_HOST_MARK_STACK)
     target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_GC_HOST_MARK_STACK)
 endif()
 
+if(NANO_POSIX_DEADLINE_QUANTUM)
+    target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_DEADLINE_QUANTUM)
+endif()
+
 if(NANO_POSIX_GC_INCREMENTAL)
     target_sources(nanoFramework.nanoCLR PRIVATE ${REPO_ROOT}/src/CLR/Core/GarbageCollector_Incremental.cpp)
     target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_GC_INCREMENTAL)

@@ -8,8 +8,10 @@
 // reads the TSC, so a thread moving between CPUs with unsynchronised TSCs can produce a wrapped
 // (huge) duration; pin the process to one CPU (runmask) if that shows up.
 
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 
 #include <nanoCLR_Runtime.h>
@@ -79,6 +81,103 @@ void Emit(const char *line, int length, size_t capacity)
 
     EmitFormatted(line, length, capacity);
 }
+
+// Quantum samples are kept in ticks and summarised every c_QuantumBatch expired quanta.
+const uint32_t c_QuantumBatch = 512;
+
+struct QuantumSamples
+{
+    uint64_t run[c_QuantumBatch];           // start to end, expired quanta
+    uint64_t timer[c_QuantumBatch];         // start to the timer firing
+    uint64_t over[c_QuantumBatch];          // the timer firing past its armed length
+    uint64_t notice[c_QuantumBatch];        // the timer firing to Execute returning
+    uint64_t boundary[c_QuantumBatch];      // Execute returning to end, expired quanta
+    uint64_t gap[c_QuantumBatch];           // the previous run's end to this start, expired quanta
+    uint64_t shortBoundary[c_QuantumBatch]; // the boundary of runs that ended before their quantum
+    uint64_t shortGap[c_QuantumBatch];      // the gap before those runs
+    uint32_t count;
+    uint32_t matched;  // expired quanta whose firing stamp fell inside the run
+    uint32_t deadline; // expired quanta armed for less than the full quantum
+    uint32_t gaps;
+    uint32_t shortCount; // all short runs; only the first c_QuantumBatch are kept
+    uint32_t shortGaps;
+    uint32_t batch;
+    uint64_t lastEmit; // the previous batch's emit, in ticks
+};
+
+std::atomic<uint64_t> s_quantumFired{0};
+QuantumSamples s_quantum;
+uint64_t s_lastQuantumEnd = 0;
+uint32_t s_quantumArmedMs = CLR_RT_Thread::c_TimeQuantum_Milliseconds;
+
+// Appends " name_us=median/p99/max" for the first n values, sorting them in place.
+int AppendDistribution(char *out, size_t capacity, const char *name, uint64_t *values, uint32_t n)
+{
+    if (n == 0)
+    {
+        return std::snprintf(out, capacity, " %s_us=-", name);
+    }
+
+    std::qsort(values, n, sizeof(uint64_t), [](const void *a, const void *b) {
+        uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+        return (x > y) - (x < y);
+    });
+    return std::snprintf(
+        out,
+        capacity,
+        " %s_us=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+        name,
+        ToNs(values[n / 2]) / 1000,
+        ToNs(values[(uint64_t)n * 99 / 100]) / 1000,
+        ToNs(values[n - 1]) / 1000);
+}
+
+void EmitQuantumBatch()
+{
+    QuantumSamples &q = s_quantum;
+    uint64_t emitStart = GcTiming_Now();
+    char line[896];
+    size_t used = 0;
+    auto append = [&](int n) {
+        if (n > 0)
+        {
+            size_t room = sizeof(line) - 1 - used;
+            used += (size_t)n < room ? (size_t)n : room;
+        }
+    };
+
+    append(std::snprintf(
+        line,
+        sizeof(line),
+        "[QNT] batch=%" PRIu32 " quanta=%" PRIu32 " matched=%" PRIu32 " deadline=%" PRIu32 " short=%" PRIu32
+        " last_emit_us=%" PRIu64,
+        q.batch,
+        q.count,
+        q.matched,
+        q.deadline,
+        q.shortCount,
+        ToNs(q.lastEmit) / 1000));
+    append(AppendDistribution(line + used, sizeof(line) - used, "run", q.run, q.count));
+    append(AppendDistribution(line + used, sizeof(line) - used, "timer", q.timer, q.matched));
+    append(AppendDistribution(line + used, sizeof(line) - used, "timer_over", q.over, q.matched));
+    append(AppendDistribution(line + used, sizeof(line) - used, "notice", q.notice, q.matched));
+    append(AppendDistribution(line + used, sizeof(line) - used, "boundary", q.boundary, q.count));
+    append(AppendDistribution(line + used, sizeof(line) - used, "gap", q.gap, q.gaps));
+    append(AppendDistribution(
+        line + used,
+        sizeof(line) - used,
+        "short_boundary",
+        q.shortBoundary,
+        q.shortCount < c_QuantumBatch ? q.shortCount : c_QuantumBatch));
+    append(AppendDistribution(line + used, sizeof(line) - used, "short_gap", q.shortGap, q.shortGaps));
+    append(std::snprintf(line + used, sizeof(line) - used, "\r\n"));
+
+    Emit(line, (int)used, sizeof(line));
+
+    q.count = q.matched = q.deadline = q.gaps = q.shortCount = q.shortGaps = 0;
+    q.batch++;
+    q.lastEmit = GcTiming_Now() - emitStart;
+}
 } // namespace
 
 uint64_t GcTiming_Now()
@@ -142,4 +241,68 @@ void GcTiming_ReportCompaction(uint32_t run, uint64_t start, uint64_t end, uint3
         heapBytes);
 
     Emit(line, n, sizeof(line));
+}
+
+void GcTiming_QuantumArmed(uint32_t milliseconds)
+{
+    s_quantumArmedMs = milliseconds;
+}
+
+void GcTiming_QuantumFired()
+{
+    s_quantumFired.store(GcTiming_Now(), std::memory_order_relaxed);
+    // Keeps the stamp ahead of the caller's plain flag store in hardware; the reader filters by window anyway.
+    std::atomic_thread_fence(std::memory_order_release);
+}
+
+void GcTiming_ReportQuantum(uint64_t start, uint64_t returned, uint64_t end, bool expired)
+{
+    QuantumSamples &q = s_quantum;
+    uint64_t lastEnd = s_lastQuantumEnd;
+    bool hasGap = lastEnd != 0 && lastEnd <= start;
+    s_lastQuantumEnd = end;
+
+    if (!expired)
+    {
+        if (q.shortCount < c_QuantumBatch)
+        {
+            q.shortBoundary[q.shortCount] = end - returned;
+            if (hasGap)
+            {
+                q.shortGap[q.shortGaps++] = start - lastEnd;
+            }
+        }
+        q.shortCount++;
+        return;
+    }
+
+    q.run[q.count] = end - start;
+    q.boundary[q.count] = end - returned;
+    q.count++;
+    if (s_quantumArmedMs < CLR_RT_Thread::c_TimeQuantum_Milliseconds)
+    {
+        q.deadline++;
+    }
+
+    if (hasGap)
+    {
+        q.gap[q.gaps++] = start - lastEnd;
+    }
+
+    // A stamp outside the run belongs to another quantum; leave it out of the timer and notice columns.
+    uint64_t fired = s_quantumFired.load(std::memory_order_relaxed);
+    if (fired >= start && fired <= returned)
+    {
+        static const uint64_t ticksPerMs = TicksPerSecond() / 1000;
+        uint64_t armed = s_quantumArmedMs * ticksPerMs;
+        q.timer[q.matched] = fired - start;
+        q.over[q.matched] = fired - start > armed ? fired - start - armed : 0;
+        q.notice[q.matched] = returned - fired;
+        q.matched++;
+    }
+
+    if (q.count == c_QuantumBatch)
+    {
+        EmitQuantumBatch();
+    }
 }
