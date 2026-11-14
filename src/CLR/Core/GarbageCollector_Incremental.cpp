@@ -1531,6 +1531,10 @@ CLR_UINT32 ApplyFreeMask(CLR_RT_HeapCluster *hc, size_t first, size_t end)
 
     last->SetPrev(nullptr);
 
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+    hc->FitHints_Begin();
+#endif
+
     for (size_t x = NextSet(first, end, freeBits); x < end; runs++)
     {
         const size_t y = NextSet(x, end, keptBits);
@@ -1544,6 +1548,10 @@ CLR_UINT32 ApplyFreeMask(CLR_RT_HeapCluster *hc, size_t first, size_t end)
         last->SetNext(node);
         node->SetPrev(last);
         last = node;
+
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+        hc->FitHints_Note(node, length);
+#endif
 
         node->Debug_ClearBlock(SENTINEL_RECOVERED);
 
@@ -1721,6 +1729,9 @@ void CheckSweptHeap()
         }
 
         const CLR_RT_HeapBlock_Node *previous = nullptr;
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+        bool badList = false;
+#endif
 
         NANOCLR_FOREACH_NODE(CLR_RT_HeapBlock_Node, node, hc->m_freeList)
         {
@@ -1731,6 +1742,9 @@ void CheckSweptHeap()
                 node + size > hc->m_payloadEnd || i < 0)
             {
                 report("bad free-list node", i < 0 ? FirstSlot(hc) : (size_t)i);
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+                badList = true;
+#endif
                 break;
             }
 
@@ -1743,6 +1757,49 @@ void CheckSweptHeap()
             previous = node;
         }
         NANOCLR_FOREACH_NODE_END();
+
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+        // The fit hints hold: no block before a class's first fit is that long, every first fit is on the list (or is
+        // its tail), and no block is longer than the largest-free bound. Invalid hints are rebuilt before use. Skipped
+        // for a list that failed the walk above, which may not end.
+        static_assert(CLR_RT_HeapCluster::c_FitClasses <= 32, "seen is a 32-bit mask");
+
+        if (hc->m_fitValid && !badList)
+        {
+            CLR_UINT32 seen = 0;
+
+            NANOCLR_FOREACH_NODE(CLR_RT_HeapBlock_Node, node, hc->m_freeList)
+            {
+                const CLR_UINT32 size = node->DataSize();
+
+                for (CLR_UINT32 k = 0; k < CLR_RT_HeapCluster::c_FitClasses; k++)
+                {
+                    if (hc->m_fitFirst[k] == node)
+                    {
+                        seen |= 1u << k;
+                    }
+                    else if ((seen & (1u << k)) == 0 && size > k)
+                    {
+                        report("fit hint skips a fitting block", (size_t)SlotIndex(node));
+                    }
+                }
+
+                if (size > hc->m_fitMaxFree)
+                {
+                    report("free block above the largest-free bound", (size_t)SlotIndex(node));
+                }
+            }
+            NANOCLR_FOREACH_NODE_END();
+
+            for (CLR_UINT32 k = 0; k < CLR_RT_HeapCluster::c_FitClasses; k++)
+            {
+                if ((seen & (1u << k)) == 0 && hc->m_fitFirst[k] != hc->m_freeList.Tail())
+                {
+                    report("fit hint not on the free list", FirstSlot(hc));
+                }
+            }
+        }
+#endif
     }
     NANOCLR_FOREACH_NODE_END();
 

@@ -55,6 +55,7 @@ option(NANO_POSIX_GC_TIMING "Print a [GCT] timing line for every GC and heap com
 option(NANO_POSIX_GC_HOST_MARK_STACK "Take GC mark-stack overflow chunks from host memory instead of the managed heap." ON)
 option(NANO_POSIX_GC_INCREMENTAL "Build the incremental-GC write barrier and heap bitmaps (experimental)." OFF)
 option(NANO_POSIX_DEADLINE_QUANTUM "End a thread's quantum at the next timer or wait deadline, so sleepers wake on time." ON)
+option(NANO_POSIX_ALLOC_FIT_HINTS "Keep per-cluster first-fit hints so allocation skips free blocks and clusters that are too small." ON)
 
 # Note: the standard embedded-target layout (nanoBooter/ + nanoCLR/ + common/) applies to
 # board targets (ChibiOS, ThreadX, ESP32, etc.).  Host/virtual targets (targets/win32,

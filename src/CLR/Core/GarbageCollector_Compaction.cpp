@@ -283,6 +283,9 @@ void CLR_RT_GarbageCollector::Heap_Compact()
                     CLR_RT_HeapBlock_Node *freeRegionNext = freeRegion->Next();
 
                     freeRegion->Unlink();
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+                    freeRegion_hc->FitHints_Invalidate();
+#endif
 
 #ifdef DEBUG
 

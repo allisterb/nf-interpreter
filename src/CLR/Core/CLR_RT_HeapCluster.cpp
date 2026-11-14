@@ -92,8 +92,31 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
 
     m_freeList.ValidateList();
 
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+    if (!m_fitValid)
+    {
+        FitHints_Rebuild();
+    }
+
+    // Lengths of c_FitClasses and up share the last class.
+    const CLR_UINT32 fitClass = length < 1 ? 1 : (length < c_FitClasses ? length : c_FitClasses);
+
+    if (length > m_fitMaxFree)
+    {
+#if defined(NANOCLR_GC_TIMING)
+        const uint64_t timingSkipped = GcTiming_Now();
+        GcTiming_ReportExtract(timingStart, timingSkipped, timingSkipped, timingNodes);
+#endif
+        return nullptr;
+    }
+#endif
+
     if (flags & CLR_RT_HeapBlock::HB_Event)
     {
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+        CLR_UINT32 largest = 0;
+#endif
+
         NANOCLR_FOREACH_NODE_BACKWARD(CLR_RT_HeapBlock_Node, ptr, m_freeList)
         {
 #if defined(NANOCLR_GC_TIMING)
@@ -106,11 +129,67 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
                 res = ptr;
                 break;
             }
+
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+            if (available > largest)
+            {
+                largest = available;
+            }
+#endif
         }
         NANOCLR_FOREACH_NODE_BACKWARD_END();
+
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+        if (res == nullptr)
+        {
+            // The whole list was seen.
+            m_fitMaxFree = largest;
+        }
+#endif
     }
     else
     {
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+        // Every block before the class's first fit is shorter than the class, so shorter than length.
+        CLR_UINT32 largest = fitClass - 1;
+
+        for (CLR_RT_HeapBlock_Node *ptr = m_fitFirst[fitClass - 1]; ptr->Next() != nullptr; ptr = ptr->Next())
+        {
+#if defined(NANOCLR_GC_TIMING)
+            timingNodes++;
+#endif
+            available = ptr->DataSize();
+
+            if (available >= length)
+            {
+                res = ptr;
+
+                // sanity checks for out of bounds
+                if ((void *)res < (void *)s_CLR_RT_Heap.location ||
+                    (void *)res >= (void *)(s_CLR_RT_Heap.location + s_CLR_RT_Heap.size))
+                {
+                    return nullptr;
+                }
+
+                break;
+            }
+
+            if (available > largest)
+            {
+                largest = available;
+            }
+        }
+
+        if (res == nullptr)
+        {
+            // The whole list was seen: nothing here is length long.
+            m_fitMaxFree = largest;
+        }
+        else if (length == fitClass)
+        {
+            m_fitFirst[fitClass - 1] = res;
+        }
+#else
         NANOCLR_FOREACH_NODE(CLR_RT_HeapBlock_Node, ptr, m_freeList)
         {
 #if defined(NANOCLR_GC_TIMING)
@@ -133,6 +212,7 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
             }
         }
         NANOCLR_FOREACH_NODE_END();
+#endif
     }
 
 #if defined(NANOCLR_GC_TIMING)
@@ -202,6 +282,23 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
             next->SetPrev(prev);
         }
 
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+        // The free block at res was unlinked, or replaced by its remainder at res + length. An event allocation that
+        // leaves a remainder keeps the free block in place.
+        if (available == 0 || (flags & CLR_RT_HeapBlock::HB_Event) == 0)
+        {
+            CLR_RT_HeapBlock_Node *successor = available == 0 ? next : &res[length];
+
+            for (CLR_UINT32 i = 0; i < c_FitClasses; i++)
+            {
+                if (m_fitFirst[i] == res)
+                {
+                    m_fitFirst[i] = successor;
+                }
+            }
+        }
+#endif
+
         res->SetDataId(CLR_RT_HEAPBLOCK_RAW_ID(dataType, flags, length));
         NANOCLR_GC_ON_ALLOCATE(res, flags)
 
@@ -238,6 +335,10 @@ void CLR_RT_HeapCluster::RecoverFromGC()
     //
     CLR_RT_HeapBlock_Node *last = m_freeList.Head();
     last->SetPrev(nullptr);
+
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+    FitHints_Begin();
+#endif
 
     while (ptr < end)
     {
@@ -283,6 +384,10 @@ void CLR_RT_HeapCluster::RecoverFromGC()
             last->SetNext(ptr);
             ptr->SetPrev(last);
             last = ptr;
+
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+            FitHints_Note(ptr, lenTot);
+#endif
 
             ptr->Debug_ClearBlock(SENTINEL_RECOVERED);
 
@@ -354,8 +459,39 @@ CLR_RT_HeapBlock_Node *CLR_RT_HeapCluster::InsertInOrder(CLR_RT_HeapBlock_Node *
     NANOCLR_GC_ON_FREE(node, size)
     node->Debug_ClearBlock(SENTINEL_CLUSTER_INSERT);
 
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+    FitHints_Invalidate();
+#endif
+
     return node;
 }
+
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+
+void CLR_RT_HeapCluster::FitHints_Begin()
+{
+    for (CLR_UINT32 i = 0; i < c_FitClasses; i++)
+    {
+        m_fitFirst[i] = m_freeList.Tail();
+    }
+
+    m_fitMaxFree = 0;
+    m_fitNoted = 0;
+    m_fitValid = true;
+}
+
+void CLR_RT_HeapCluster::FitHints_Rebuild()
+{
+    FitHints_Begin();
+
+    NANOCLR_FOREACH_NODE(CLR_RT_HeapBlock_Node, ptr, m_freeList)
+    {
+        FitHints_Note(ptr, ptr->DataSize());
+    }
+    NANOCLR_FOREACH_NODE_END();
+}
+
+#endif
 
 //--//
 

@@ -207,6 +207,21 @@ IPv4 addresses exposed by the managed snapshot.
   with `Sleep(1)` gives every thread 1–2 ms quanta, so GC work at boundaries can take up to about
   20× its usual share of the CPU.
 
+`NANO_POSIX_ALLOC_FIT_HINTS`
+- Default: `ON`
+- Each heap cluster keeps search hints over its address-ordered free list: for each length from 1
+  to 32 blocks, the first free block that could fit, and a bound on the largest free block. An
+  allocation starts its first-fit walk at its length's hint, and skips a cluster whose bound is too
+  small without walking it. Blocks are placed exactly where the plain first-fit walk would put them.
+- Why: on large heaps the free lists fragment, and the first-fit search walked hundreds of small
+  blocks per allocation, plus every cluster's list whenever the last-used cluster had no fit. `[ALC]`
+  measured that search at 85–90% of interpreter time with a 400 MiB heap.
+- The define is `NANOCLR_ALLOC_FIT_HINTS`. Hints are rebuilt with each cluster's free list after a
+  sweep and after compaction. With `NANOCLR_GC_INCREMENTAL_STRESS`, the end-of-sweep check also
+  verifies them (`[GCS] sweep check: fit hint ...`). Turn it off for comparisons; the cluster
+  header is then as upstream.
+- Cost: about 270 bytes per cluster header (64-bit), and up to 32 pointer compares per allocation.
+
 `NANO_POSIX_GC_HOST_MARK_STACK`
 - Default: `ON`
 - When marking outgrows its 128-entry stack, take further stack chunks of 16384 entries (about

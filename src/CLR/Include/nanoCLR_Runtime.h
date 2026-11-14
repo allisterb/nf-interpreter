@@ -2647,6 +2647,37 @@ struct CLR_RT_HeapCluster : public CLR_RT_HeapBlock_Node // EVENT HEAP - NO RELO
     CLR_RT_HeapBlock_Node *m_payloadStart;
     CLR_RT_HeapBlock_Node *m_payloadEnd;
 
+#if defined(NANOCLR_ALLOC_FIT_HINTS)
+    // Search hints over the address-ordered free list. No free block before m_fitFirst[n - 1] has n or more blocks
+    // (the list tail when none has); no free block is larger than m_fitMaxFree. Rebuilt with the list; invalidated
+    // when the list is changed outside the allocator and the rebuilds (compaction), and then rebuilt on next use.
+    static const CLR_UINT32 c_FitClasses = 32;
+
+    CLR_RT_HeapBlock_Node *m_fitFirst[c_FitClasses];
+    CLR_UINT32 m_fitMaxFree;
+    CLR_UINT32 m_fitNoted; // while rebuilding: classes whose first fit has been found
+    bool m_fitValid;
+
+    void FitHints_Begin();
+    void FitHints_Note(CLR_RT_HeapBlock_Node *node, CLR_UINT32 size)
+    {
+        if (size > m_fitMaxFree)
+        {
+            m_fitMaxFree = size;
+        }
+
+        for (; m_fitNoted < size && m_fitNoted < c_FitClasses; m_fitNoted++)
+        {
+            m_fitFirst[m_fitNoted] = node;
+        }
+    }
+    void FitHints_Rebuild();
+    void FitHints_Invalidate()
+    {
+        m_fitValid = false;
+    }
+#endif
+
     //--//
 
     void HeapCluster_Initialize(CLR_UINT32 size, CLR_UINT32 blockSize); // Memory is not erased by the caller.
