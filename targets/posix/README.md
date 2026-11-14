@@ -250,12 +250,27 @@ IPv4 addresses exposed by the managed snapshot.
 
   When `OFF`, every hook compiles to nothing.
 - `NANOCLR_GC_INCREMENTAL=1` turns on incremental cycles.
-  - **Start:** once `NANOCLR_GC_INCREMENTAL_TRIGGER` percent of the heap (1–100, default 25) has been
-    allocated since the last collection, the next thread-quantum boundary takes the initial pause.
-    The pause snapshots the roots and turns the barrier on.
+  - **Start:** once `NANOCLR_GC_INCREMENTAL_TRIGGER` percent of the heap (1–100; default 1 with
+    allocation pacing, 25 without) has been allocated since the last collection, the initial pause
+    runs. It runs inside the allocator with allocation pacing, and at the next thread-quantum boundary
+    without it. The pause snapshots the roots and turns the barrier on.
   - **Slices:** each later quantum boundary scans about `NANOCLR_GC_INCREMENTAL_SLICE` slots of grey
     objects (default 4096). This is a soft target: an object is scanned whole, except that
     reference arrays longer than 1024 elements are scanned in chunks.
+  - **Allocation pacing** (`NANOCLR_GC_INCREMENTAL_PACE=P`, default 50; `0` turns it off).
+    - Between slices, the allocator also marks in steps of about `NANOCLR_GC_INCREMENTAL_PACE_STEP`
+      slots (default 512). The steps are sized so the cycle's estimated mark work W is done by the time
+      P percent of the free memory F at the cycle's start has been allocated.
+    - W is the heap in use at the start, or 5/4 of the last cycle's scan if that is smaller. A cycle
+      that scans past W with grey work left doubles W, up to the heap in use, and catches up.
+    - A step that falls behind scans at most 16 steps' worth.
+    - This is Siebert's P(F) pacing: one setting keeps up from 40 to 400 MiB, while fixed quantum
+      slices do so only at one heap size and allocation rate.
+    - The low default trigger matters. Snapshot marking keeps everything allocated during a cycle
+      until the next one, so a late start leaves too little free memory to pace over. At 40 MiB with
+      a 25% trigger, half the cycles aborted into stop-the-world collections; with 1%, none did.
+    - `[GCC]` lines report `pace_steps`, `pace_max_us`, `pace_work` (the final W) and `pace_budget`
+      (P% of F, in slots).
   - **Finish:** when no grey work is left, a full collection runs with the cycle's mark in place of
     the stop-the-world mark. That final pause no longer sweeps the heap: it starts the sweep.
   - **Bitmap sweep:** the free lists are rebuilt from the bitmaps instead of walking every block

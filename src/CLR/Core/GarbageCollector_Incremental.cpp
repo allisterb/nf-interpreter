@@ -51,6 +51,17 @@
 // NANOCLR_GC_INCREMENTAL_STATS=1 each finished cycle prints one "[GCC]" line, at the next quantum boundary so that the
 // print is not part of the pause. GC-stress mode (NANOCLR_GC_INCREMENTAL_STRESS=N) also starts a cycle or runs a slice
 // every N object allocations, from inside the allocator, so marking interleaves with native code as well as with IL.
+//
+// Allocation pacing (NANOCLR_GC_INCREMENTAL_PACE=P, default 50; 0 = quantum slices only): the cycle starts inside the
+// allocator once the trigger is reached (default 1% with pacing: snapshot marking reclaims only what was dead at the
+// cycle's start, so a late start leaves too little free memory to pace over), and marks in steps of about
+// NANOCLR_GC_INCREMENTAL_PACE_STEP slots (default 512) from inside the allocator too, so that its estimated mark work W
+// is done by the time P percent of the free memory F at its start has been allocated: after a object slots allocated,
+// W * a / (F * P / 100) slots have been scanned, counting the quantum slices (Siebert's P(F) pacing, and the progress
+// invariant of Robertz & Henriksson). W is the heap in use at the start, which bounds the cycle's scan work, or 5/4 of
+// the last cycle's scan when that is smaller; a cycle that scans past W with grey work left doubles it (up to the heap
+// in use), and the 100 - P percent of F left over absorbs the catch-up (at P=100 there is none). A step that falls
+// behind (a large allocation, or a raised W) scans at most 16 steps' worth; later allocations catch up.
 
 #include "Core.h"
 
@@ -120,6 +131,10 @@ struct GcIncrementalCycle
     CLR_UINT32 finalScannedObjects; // objects still grey at the final pause
     CLR_UINT32 allocatedBlack;
     CLR_UINT32 greyMax;
+    CLR_UINT32 paceSteps;   // allocation-paced mark steps
+    uint64_t paceStepMaxNs; // longest of them
+    CLR_UINT32 paceWork;    // allocation pacing: the mark work estimate W, in slots (final, after any re-estimate)
+    CLR_UINT32 paceBudget;  // and the allocation budget it is spread over, in slots
 };
 
 // A finished cycle's "[GCC]" line, kept from the end of its sweep until the next quantum boundary prints it.
@@ -203,6 +218,15 @@ size_t s_sliceSlots;       // marking budget per quantum, in slots scanned
 size_t s_allocatedSinceGc; // object slots allocated since the last collection
 CLR_UINT32 s_stressEvery;  // GC-stress mode: an incremental step every this many object allocations; 0 = off
 CLR_UINT32 s_stressCount;
+CLR_UINT32 s_pacePercent;      // NANOCLR_GC_INCREMENTAL_PACE: share of the free memory a cycle may mark over; 0 = off
+size_t s_paceStepSlots;        // NANOCLR_GC_INCREMENTAL_PACE_STEP: scan work per paced step
+size_t s_paceWork;             // this cycle's mark work estimate W, in slots
+size_t s_paceUsed;             // heap in use at the cycle's start, in slots: the bound on W
+size_t s_paceBudget;           // object slots this cycle may allocate while W is scanned
+size_t s_paceAllocated;        // object slots allocated since the cycle started
+size_t s_paceNext;             // run the next paced step once s_paceAllocated reaches this
+size_t s_lastScannedSlots;     // the last cycle's scan work (a lower bound if it was aborted); 0 = none yet
+size_t s_allocatedAtFreeCount; // s_allocatedSinceGc when gc.m_freeBytes was last made exact
 CLR_UINT32 s_cycleCount;
 GcIncrementalCycle s_cycle;
 bool s_cycleStats;    // NANOCLR_GC_INCREMENTAL_STATS=1: report each finished cycle on a "[GCC]" line
@@ -742,6 +766,8 @@ size_t FirstCycleBit()
     return c_noBit;
 }
 
+CLR_UINT32 TotalBytes();
+
 // Initial pause: snapshot the roots and turn the barrier on. Never while the last cycle's sweep runs. The cycle
 // bitmaps are already clear: only a cycle and its sweep set bits in them, and every way out of one clears them (the
 // bitmap sweep cluster by cluster, a header sweep in OnSwept, an abort in EndCycle, the nested-collection error in
@@ -775,6 +801,30 @@ void StartCycle()
 
     ShadeRoots();
 
+    if (s_pacePercent != 0)
+    {
+        // Free memory now: the exact count from the last collection or sweep, less the object slots allocated since
+        // (event slots are not counted, so it is a slight overestimate). Before the first collection there is no count:
+        // the whole heap less the object slots allocated since boot.
+        const CLR_RT_GarbageCollector &gc = g_CLR_RT_GarbageCollector;
+        const bool noCount = gc.m_totalBytes == 0;
+        const size_t total = (noCount ? TotalBytes() : gc.m_totalBytes) / c_slotSize;
+        const size_t counted = noCount ? total : gc.m_freeBytes / c_slotSize;
+        const size_t since = s_allocatedSinceGc - s_allocatedAtFreeCount;
+        const size_t freeSlots = counted > since ? counted - since : 0;
+        const size_t used = total > freeSlots ? total - freeSlots : 1;
+        const size_t lastBased = s_lastScannedSlots / 4 * 5 + s_paceStepSlots;
+
+        s_paceUsed = used;
+        s_paceWork = s_lastScannedSlots != 0 && lastBased < used ? lastBased : used;
+        s_paceBudget = freeSlots / 100 * s_pacePercent;
+        s_paceBudget = s_paceBudget < s_paceStepSlots ? s_paceStepSlots : s_paceBudget;
+        s_paceAllocated = 0;
+        s_paceNext = (size_t)((uint64_t)s_paceStepSlots * s_paceBudget / s_paceWork);
+        s_cycle.paceWork = (CLR_UINT32)s_paceWork;
+        s_cycle.paceBudget = (CLR_UINT32)s_paceBudget;
+    }
+
     s_cycle.initialNs = NowNs() - s_cycle.startNs;
 }
 
@@ -801,6 +851,11 @@ void AbortCycle(const char *reason)
         reason,
         (unsigned)s_cycle.slices);
 
+    if (s_cycle.scannedSlots > s_lastScannedSlots)
+    {
+        s_lastScannedSlots = s_cycle.scannedSlots;
+    }
+
     EndCycle();
 }
 
@@ -821,6 +876,56 @@ bool RunSlice()
     return done;
 }
 
+// Allocation pacing, from inside the allocator: scan until the cycle's progress catches up with its allocation (at most
+// 16 steps' worth at once), then set the allocation count for the next step. Grey work found empty here waits for the
+// final pause at the next quantum boundary.
+void PaceStep()
+{
+    // Grey work is left past the estimate W (the live set grew): double it, up to the heap in use, and catch up.
+    auto reestimate = []() {
+        if (s_cycle.scannedSlots >= s_paceWork && s_paceWork < s_paceUsed &&
+            (s_greyCount != 0 || s_partialArray != nullptr))
+        {
+            const size_t doubled = (size_t)s_cycle.scannedSlots * 2;
+
+            s_paceWork = doubled < s_paceUsed ? doubled : s_paceUsed;
+            s_cycle.paceWork = (CLR_UINT32)s_paceWork;
+        }
+    };
+
+    reestimate();
+
+    const uint64_t required = (uint64_t)s_paceWork * s_paceAllocated / s_paceBudget;
+    const size_t scanned = s_cycle.scannedSlots;
+    bool done = false;
+
+    if (required > scanned)
+    {
+        const size_t cap = s_paceStepSlots * 16;
+        const size_t behind = (size_t)(required - scanned);
+        const uint64_t start = NowNs();
+
+        done = Drain(behind < cap ? behind : cap);
+
+        const uint64_t elapsed = NowNs() - start;
+
+        s_cycle.paceSteps++;
+
+        if (elapsed > s_cycle.paceStepMaxNs)
+        {
+            s_cycle.paceStepMaxNs = elapsed;
+        }
+    }
+
+    if (!done)
+    {
+        reestimate();
+    }
+
+    s_paceNext = done ? (size_t)-1
+                      : (size_t)(((uint64_t)s_cycle.scannedSlots + s_paceStepSlots) * s_paceBudget / s_paceWork);
+}
+
 // Prints a finished cycle's "[GCC]" line. The bitmap-sweep fields are 0 unless its bitmap sweep ran.
 void PrintReport(const GcIncrementalReport &r)
 {
@@ -836,7 +941,8 @@ void PrintReport(const GcIncrementalReport &r)
     // formats into 512 bytes, and a cut line loses its line end.
     CLR_Debug::Printf(
         "[GCC] cycle=%u run=%u slices=%u initial_us=%u slice_max_us=%u final_mark_us=%u live_us=%u sweep_us=%u "
-        "bitmap_sweep=%u total_ms=%u roots=%u scanned=%u slots=%u final_scanned=%u allocated_black=%u grey_max=%u ",
+        "bitmap_sweep=%u total_ms=%u roots=%u scanned=%u slots=%u final_scanned=%u allocated_black=%u grey_max=%u "
+        "pace_steps=%u pace_max_us=%u pace_work=%u pace_budget=%u ",
         (unsigned)r.number,
         (unsigned)c.run,
         (unsigned)c.slices,
@@ -852,7 +958,11 @@ void PrintReport(const GcIncrementalReport &r)
         (unsigned)c.scannedSlots,
         (unsigned)c.finalScannedObjects,
         (unsigned)c.allocatedBlack,
-        (unsigned)c.greyMax);
+        (unsigned)c.greyMax,
+        (unsigned)c.paceSteps,
+        (unsigned)(c.paceStepMaxNs / 1000),
+        (unsigned)c.paceWork,
+        (unsigned)c.paceBudget);
     CLR_Debug::Printf(
         "pre_us=%u heap_us=%u clear_us=%u mask_us=%u apply_us=%u post_us=%u free_runs=%u dead_objects=%u "
         "fallback_clusters=%u sweep_steps=%u step_max_us=%u sweep_span_ms=%u swept_on_alloc=%u catchup_steps=%u "
@@ -1868,6 +1978,7 @@ void EndSweep()
     gc.m_totalBytes = TotalBytes();
     gc.m_freeBytes = (CLR_UINT32)((s_sweptFreeBlocks - s_sweptReused) * c_slotSize);
     s_cycle.usedBytes = gc.m_totalBytes - gc.m_freeBytes;
+    s_allocatedAtFreeCount = s_allocatedSinceGc;
 
     QueueReport();
 }
@@ -2025,6 +2136,26 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
         StressStep();
     }
 
+    // Allocation pacing, at the same point and for the same reasons as stress mode: a cycle started here allocates this
+    // block black.
+    if (s_pacePercent != 0 && s_incremental &&
+        g_CLR_RT_ExecutionEngine.m_heapState != CLR_RT_ExecutionEngine::c_HeapState_UnderGC)
+    {
+        if (s_cycleActive)
+        {
+            s_paceAllocated += size;
+
+            if (s_paceAllocated >= s_paceNext && !s_greyOverflow)
+            {
+                PaceStep();
+            }
+        }
+        else if (s_allocatedSinceGc >= s_triggerSlots && !s_sweeping && !CLR_EE_IS(Compaction_Pending))
+        {
+            StartCycle();
+        }
+    }
+
     SetBit(s_starts, (size_t)i);
     s_allocatedSinceGc += size;
 
@@ -2159,6 +2290,9 @@ void GcIncremental_OnHeapInitialized()
     s_cycleActive = false;
     s_incremental = false;
     s_allocatedSinceGc = 0;
+    s_allocatedAtFreeCount = 0;
+    s_lastScannedSlots = 0;
+    s_pacePercent = 0;
     s_cycleCount = 0;
     s_cycleStats = false;
     s_reportPending = false;
@@ -2280,11 +2414,20 @@ void GcIncremental_OnHeapInitialized()
 
     if (s_incremental)
     {
+        const char *pace = getenv("NANOCLR_GC_INCREMENTAL_PACE");
+        const char *paceStep = getenv("NANOCLR_GC_INCREMENTAL_PACE_STEP");
+        unsigned long pacePercent = pace && pace[0] != '\0' ? strtoul(pace, nullptr, 10) : 50;
+        s_pacePercent = (CLR_UINT32)(pacePercent > 100 ? 100 : pacePercent);
+        s_paceStepSlots = paceStep && strtoul(paceStep, nullptr, 10) ? strtoul(paceStep, nullptr, 10) : 512;
+        s_paceStepSlots = s_paceStepSlots > s_slots ? s_slots : s_paceStepSlots;
+
+        // Paced cycles start almost as soon as the last one is swept, so each has most of the free memory to pace over.
+        const unsigned long defaultTrigger = s_pacePercent != 0 ? 1 : 25;
         const char *trigger = getenv("NANOCLR_GC_INCREMENTAL_TRIGGER");
         const char *slice = getenv("NANOCLR_GC_INCREMENTAL_SLICE");
-        unsigned long percent = trigger ? strtoul(trigger, nullptr, 10) : 25;
+        unsigned long percent = trigger ? strtoul(trigger, nullptr, 10) : defaultTrigger;
 
-        percent = percent == 0 ? 25 : (percent > 100 ? 100 : percent);
+        percent = percent == 0 ? defaultTrigger : (percent > 100 ? 100 : percent);
         s_triggerSlots = s_slots * percent / 100;
         s_sliceSlots = slice && strtoul(slice, nullptr, 10) ? strtoul(slice, nullptr, 10) : 4096;
 
@@ -2308,7 +2451,7 @@ void GcIncremental_OnHeapInitialized()
 
         CLR_Debug::Printf(
             "[GCC] incremental on: trigger=%u slots slice=%u slots stress_every=%u allocations sweep=%s stats=%u "
-            "fallback_every=%u clusters sweep_us=%u catchup_us=%u\r\n",
+            "fallback_every=%u clusters sweep_us=%u catchup_us=%u pace=%u%% pace_step=%u slots\r\n",
             (unsigned)s_triggerSlots,
             (unsigned)s_sliceSlots,
             (unsigned)s_stressEvery,
@@ -2316,7 +2459,9 @@ void GcIncremental_OnHeapInitialized()
             (unsigned)s_cycleStats,
             (unsigned)s_sweepFallbackEvery,
             (unsigned)(s_sweepBudgetNs / 1000),
-            (unsigned)(s_sweepCatchupNs / 1000));
+            (unsigned)(s_sweepCatchupNs / 1000),
+            (unsigned)s_pacePercent,
+            (unsigned)s_paceStepSlots);
     }
 }
 
@@ -2378,6 +2523,7 @@ bool GcIncremental_FinishCycle()
     }
 
     s_cycle.finalScannedObjects = s_cycle.scannedObjects - scannedBefore;
+    s_lastScannedSlots = s_cycle.scannedSlots;
     uint64_t liveStart = NowNs();
 
     // The live bitmap is s_marked (marked or allocated black). It is published for IsAlive() until the sweep ends, in
@@ -2750,6 +2896,7 @@ void GcIncremental_OnFullMark()
 
     s_stats = {};
     s_allocatedSinceGc = 0;
+    s_allocatedAtFreeCount = 0;
 
     // Reaching this from FinishCycle to OnSwept of one collection means a collection nested inside a final pause, which
     // breaks the outer sweep (as any nested collection does); report it loudly.
