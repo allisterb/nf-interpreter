@@ -360,6 +360,11 @@ if(NANO_POSIX_ALLOC_FIT_HINTS)
     target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_ALLOC_FIT_HINTS)
 endif()
 
+if(NANO_POSIX_QNX_TIMER AND CMAKE_SYSTEM_NAME STREQUAL "QNX")
+    target_sources(nanoFramework.nanoCLR PRIVATE QnxTimer.cpp)
+    target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_QNX_TIMER)
+endif()
+
 if(NANO_POSIX_GC_INCREMENTAL)
     target_sources(nanoFramework.nanoCLR PRIVATE ${REPO_ROOT}/src/CLR/Core/GarbageCollector_Incremental.cpp)
     target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_GC_INCREMENTAL)

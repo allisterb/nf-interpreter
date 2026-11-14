@@ -42,6 +42,17 @@ extern "C"
     uint32_t Events_WaitForEvents(uint32_t powerLevel, uint32_t wakeupSystemEvents, uint32_t timeoutMilliseconds);
 
     void Events_SetBoolTimer(bool *timerCompleteFlag, uint32_t millisecondsFromNow);
+
+#if defined(NANOCLR_QNX_TIMER)
+    // posix host on QNX: as above, but to an absolute HAL time (100 ns ticks) while the kernel timer is on. The
+    // millisecond argument is used otherwise.
+    uint32_t Events_WaitForEventsUntil(
+        uint32_t powerLevel,
+        uint32_t wakeupSystemEvents,
+        uint32_t timeoutMilliseconds,
+        uint64_t deadlineTicks);
+    void Events_SetBoolTimerUntil(bool *timerCompleteFlag, uint32_t millisecondsFromNow, uint64_t deadlineTicks);
+#endif
     void Events_SetCallback(set_Event_Callback pfn, void *arg);
     void FreeManagedEvent(uint8_t category, uint8_t subCategory, uint16_t data1, uint32_t data2);
 

@@ -4751,7 +4751,11 @@ CLR_UINT32 CLR_RT_ExecutionEngine::WaitSystemEvents(CLR_UINT32 powerLevel, CLR_U
     // TODO check if the watchdog needs to be feed here... don't think so
     Watchdog_Reset();
 
+#if defined(NANOCLR_QNX_TIMER)
+    res = ::Events_WaitForEventsUntil(powerLevel, events, timeout, (CLR_UINT64)m_currentNextActivityTime);
+#else
     res = ::Events_WaitForEvents(powerLevel, events, timeout);
+#endif
     // UNDONE: FIXME
     // ::Watchdog_GetSetEnabled( bool, bool );
     // TODO check if the watchdog needs to be feed here... don't think so

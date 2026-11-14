@@ -12,6 +12,10 @@
 #include <nanoHAL_Time.h>
 #include <nanoPAL_Events.h>
 
+#if defined(NANOCLR_QNX_TIMER)
+#include "QnxTimer.h"
+#endif
+
 // Generation counter: each new Time_SetCompare call invalidates the previous timer thread.
 static std::atomic<uint64_t> s_timerGeneration{0};
 
@@ -19,6 +23,13 @@ extern "C" void Time_SetCompare(uint64_t compareValue)
 {
     // Increment generation so any previously spawned timer thread exits without firing.
     uint64_t myGen = s_timerGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+#if defined(NANOCLR_QNX_TIMER)
+    if (QnxTimer_SetCompare(compareValue))
+    {
+        return;
+    }
+#endif
 
     std::thread([compareValue, myGen]() {
         // Convert compare value (100ns ticks) to current time delta.

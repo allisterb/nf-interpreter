@@ -17,6 +17,10 @@
 #include <nanoCLR_GcTiming.h>
 #endif
 
+#if defined(NANOCLR_QNX_TIMER)
+#include "QnxTimer.h"
+#endif
+
 namespace
 {
     std::mutex s_eventsMutex;
@@ -38,6 +42,31 @@ extern "C"
 // Forward declaration — Events_Set is defined later in this block.
 void Events_Set(uint32_t events);
 
+#if defined(NANOCLR_QNX_TIMER)
+// Blocks in MsgReceivePulse until an event of interest is set or deadline (CLOCK_MONOTONIC ns) passes
+// (QnxTimer.cpp). Re-checks the shutdown flags at least every 10 ms, as the portable loop below does.
+static uint32_t WaitForEventsQnx(uint32_t wakeupSystemEvents, uint64_t deadline)
+{
+    const uint64_t poll = 10000000ULL;
+
+    for (;;)
+    {
+        QnxTimer_BeginWait();
+
+        const uint32_t events = Events_MaskedRead(wakeupSystemEvents);
+        const uint64_t now = QnxTimer_NowNs();
+        if (events != 0 || CLR_EE_DBG_IS(RebootPending) || CLR_EE_DBG_IS(ExitPending) || now >= deadline)
+        {
+            QnxTimer_EndWait();
+            return events;
+        }
+
+        QnxTimer_WaitUntil(deadline - now < poll ? deadline : now + poll);
+        QnxTimer_EndWait();
+    }
+}
+#endif
+
 void Events_SetBoolTimer(bool *timerCompleteFlag, uint32_t millisecondsFromNow)
 {
     // Always invalidate any previously spawned timer thread by bumping the generation,
@@ -48,12 +77,22 @@ void Events_SetBoolTimer(bool *timerCompleteFlag, uint32_t millisecondsFromNow)
 
     if (timerCompleteFlag == nullptr)
     {
+#if defined(NANOCLR_QNX_TIMER)
+        QnxTimer_SetQuantum(nullptr, 0);
+#endif
         return;
     }
 
     *timerCompleteFlag = false;
 #if defined(NANOCLR_GC_TIMING)
-    GcTiming_QuantumArmed(millisecondsFromNow);
+    GcTiming_QuantumArmed(millisecondsFromNow * 1000);
+#endif
+#if defined(NANOCLR_QNX_TIMER)
+    const uint64_t deadline = QnxTimer_NowNs() + static_cast<uint64_t>(millisecondsFromNow) * 1000000ULL;
+    if (QnxTimer_SetQuantum(timerCompleteFlag, deadline))
+    {
+        return;
+    }
 #endif
     const uint64_t myGen = s_boolTimerGeneration.load(std::memory_order_acquire);
 
@@ -83,6 +122,9 @@ bool Events_Initialize()
 {
     std::lock_guard<std::mutex> lock(s_eventsMutex);
     s_systemEvents = 0;
+#if defined(NANOCLR_QNX_TIMER)
+    QnxTimer_Initialize();
+#endif
     return Events_Initialize_Platform();
 }
 
@@ -90,6 +132,9 @@ bool Events_Uninitialize()
 {
     std::lock_guard<std::mutex> lock(s_eventsMutex);
     s_systemEvents = 0;
+#if defined(NANOCLR_QNX_TIMER)
+    QnxTimer_Uninitialize();
+#endif
     return true;
 }
 
@@ -101,6 +146,9 @@ void Events_Set(uint32_t events)
     }
 
     s_eventsCondition.notify_all();
+#if defined(NANOCLR_QNX_TIMER)
+    QnxTimer_Wake();
+#endif
 }
 
 uint32_t Events_Get(uint32_t eventsOfInterest)
@@ -138,6 +186,18 @@ uint32_t Events_WaitForEvents(uint32_t powerLevel, uint32_t wakeupSystemEvents, 
         return s_systemEvents & wakeupSystemEvents;
     }
 
+#if defined(NANOCLR_QNX_TIMER)
+    if (QnxTimer_Initialize())
+    {
+        lock.unlock();
+        return WaitForEventsQnx(
+            wakeupSystemEvents,
+            timeoutMilliseconds == EVENTS_TIMEOUT_INFINITE
+                ? UINT64_MAX
+                : QnxTimer_NowNs() + static_cast<uint64_t>(timeoutMilliseconds) * 1000000ULL);
+    }
+#endif
+
     // Use a polling approach similar to the Win32 implementation: wait in short
     // slices (10 ms) so we periodically re-check the event flags and the
     // RebootPending / ExitPending conditions.  This avoids relying solely on
@@ -169,10 +229,59 @@ uint32_t Events_WaitForEvents(uint32_t powerLevel, uint32_t wakeupSystemEvents, 
             return 0;
         }
 
-        // Wait for at most 10 ms before re-checking.
-        s_eventsCondition.wait_for(lock, std::chrono::milliseconds(10));
+        // Wait for at most 10 ms before re-checking, but never past the deadline.
+        const auto poll = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
+        s_eventsCondition.wait_until(lock, poll < endTime ? poll : endTime);
     }
 }
+
+#if defined(NANOCLR_QNX_TIMER)
+void Events_SetBoolTimerUntil(bool *timerCompleteFlag, uint32_t millisecondsFromNow, uint64_t deadlineTicks)
+{
+    if (timerCompleteFlag == nullptr || !QnxTimer_Initialize())
+    {
+        Events_SetBoolTimer(timerCompleteFlag, millisecondsFromNow);
+        return;
+    }
+
+    s_boolTimerGeneration.fetch_add(1, std::memory_order_acq_rel);
+    *timerCompleteFlag = false;
+    const uint64_t deadline = deadlineTicks * 100ULL;
+#if defined(NANOCLR_GC_TIMING)
+    // A full quantum reports exactly 20 ms, so [QNT] deadline= counts only quanta that a deadline shortened.
+    const uint64_t now = QnxTimer_NowNs();
+    uint32_t armedUs = millisecondsFromNow * 1000;
+    if (millisecondsFromNow < CLR_RT_Thread::c_TimeQuantum_Milliseconds)
+    {
+        armedUs = deadline > now ? static_cast<uint32_t>((deadline - now) / 1000) : 0;
+    }
+
+    GcTiming_QuantumArmed(armedUs);
+#endif
+    if (!QnxTimer_SetQuantum(timerCompleteFlag, deadline))
+    {
+        Events_SetBoolTimer(timerCompleteFlag, millisecondsFromNow);
+    }
+}
+
+uint32_t Events_WaitForEventsUntil(
+    uint32_t powerLevel,
+    uint32_t wakeupSystemEvents,
+    uint32_t timeoutMilliseconds,
+    uint64_t deadlineTicks)
+{
+    if (timeoutMilliseconds == 0 || timeoutMilliseconds == EVENTS_TIMEOUT_INFINITE || !QnxTimer_Initialize())
+    {
+        return Events_WaitForEvents(powerLevel, wakeupSystemEvents, timeoutMilliseconds);
+    }
+
+    // The millisecond timeout is the deadline truncated, so it bounds a deadline that is out of range.
+    const uint64_t now = QnxTimer_NowNs();
+    const uint64_t latest = now + (static_cast<uint64_t>(timeoutMilliseconds) + 1) * 1000000ULL;
+    const uint64_t deadline = deadlineTicks * 100ULL;
+    return WaitForEventsQnx(wakeupSystemEvents, deadline < now ? now : deadline > latest ? latest : deadline);
+}
+#endif
 
 // set_Event_Callback matches the typedef in nanoPAL_Events.h: void (*)(void *)
 void Events_SetCallback(void (*pfn)(void *), void *arg)

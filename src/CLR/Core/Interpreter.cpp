@@ -633,7 +633,8 @@ bool CLR_RT_Thread::FindEhBlock(
 #if defined(NANOCLR_DEADLINE_QUANTUM)
 // A sleeper becomes ready only in ProcessTimer, between quanta, so end the quantum at the next timer or wait deadline
 // (ProcessTimer's cache) instead of up to 20 ms later. NANOCLR_DEADLINE_QUANTUM=0 restores fixed quanta.
-static CLR_UINT32 QuantumMilliseconds()
+// deadline: the same end as a HAL time, at least 100 us away, for a PAL that can arm an absolute timer.
+static CLR_UINT32 QuantumMilliseconds(CLR_UINT64 &deadline)
 {
     static const bool enabled = [] {
         const char *value = getenv("NANOCLR_DEADLINE_QUANTUM");
@@ -641,17 +642,22 @@ static CLR_UINT32 QuantumMilliseconds()
     }();
     const CLR_RT_ExecutionEngine &ee = g_CLR_RT_ExecutionEngine;
     const CLR_INT64 quantum = CLR_RT_Thread::c_TimeQuantum_Milliseconds * (CLR_INT64)TIME_CONVERSION__TO_MILLISECONDS;
+    const CLR_INT64 minimum = TIME_CONVERSION__TO_MILLISECONDS / 10;
+    const CLR_INT64 now = (CLR_INT64)HAL_Time_CurrentTime();
 
+    deadline = (CLR_UINT64)(now + quantum);
     if (!enabled || !ee.m_timerCache)
     {
         return CLR_RT_Thread::c_TimeQuantum_Milliseconds;
     }
 
-    CLR_INT64 left = (CLR_INT64)ee.m_timerCacheNextTimeout - (CLR_INT64)HAL_Time_CurrentTime();
+    CLR_INT64 left = (CLR_INT64)ee.m_timerCacheNextTimeout - now;
     if (left >= quantum)
     {
         return CLR_RT_Thread::c_TimeQuantum_Milliseconds;
     }
+
+    deadline = (CLR_UINT64)(now + (left < minimum ? minimum : left));
 
     // Round up: waking early would only cost an extra boundary.
     return left <= 0 ? 1
@@ -688,11 +694,16 @@ HRESULT CLR_RT_Thread::Execute()
 #endif // #if defined(NANOCLR_ENABLE_SOURCELEVELDEBUGGING)
 
 #if defined(NANOCLR_DEADLINE_QUANTUM)
-    const CLR_UINT32 quantumMs = QuantumMilliseconds();
+    CLR_UINT64 quantumDeadline;
+    const CLR_UINT32 quantumMs = QuantumMilliseconds(quantumDeadline);
 #else
     const CLR_UINT32 quantumMs = CLR_RT_Thread::c_TimeQuantum_Milliseconds;
 #endif
+#if defined(NANOCLR_DEADLINE_QUANTUM) && defined(NANOCLR_QNX_TIMER)
+    ::Events_SetBoolTimerUntil((bool *)&m_timeQuantumExpired, quantumMs, quantumDeadline);
+#else
     ::Events_SetBoolTimer((bool *)&m_timeQuantumExpired, quantumMs);
+#endif
 
     while (m_timeQuantumExpired == false && !CLR_EE_DBG_IS(Stopped))
     {

@@ -108,7 +108,7 @@ struct QuantumSamples
 std::atomic<uint64_t> s_quantumFired{0};
 QuantumSamples s_quantum;
 uint64_t s_lastQuantumEnd = 0;
-uint32_t s_quantumArmedMs = CLR_RT_Thread::c_TimeQuantum_Milliseconds;
+uint32_t s_quantumArmedUs = CLR_RT_Thread::c_TimeQuantum_Milliseconds * 1000;
 
 // Allocation cost is the free-list search plus block initialisation, summed over the clusters tried; wall time
 // also covers any collection or sweep the allocation ran. Totals are per quantum batch; the run and notice columns
@@ -345,9 +345,9 @@ void GcTiming_ReportCompaction(uint32_t run, uint64_t start, uint64_t end, uint3
     Emit(line, n, sizeof(line));
 }
 
-void GcTiming_QuantumArmed(uint32_t milliseconds)
+void GcTiming_QuantumArmed(uint32_t microseconds)
 {
-    s_quantumArmedMs = milliseconds;
+    s_quantumArmedUs = microseconds;
 }
 
 void GcTiming_QuantumFired()
@@ -449,7 +449,7 @@ void GcTiming_ReportQuantum(uint64_t start, uint64_t returned, uint64_t end, boo
     s_alloc.runCost[q.count] = runCost;
     s_alloc.runMax[q.count] = runMax;
     q.count++;
-    if (s_quantumArmedMs < CLR_RT_Thread::c_TimeQuantum_Milliseconds)
+    if (s_quantumArmedUs < CLR_RT_Thread::c_TimeQuantum_Milliseconds * 1000)
     {
         q.deadline++;
     }
@@ -464,7 +464,7 @@ void GcTiming_ReportQuantum(uint64_t start, uint64_t returned, uint64_t end, boo
     if (fired >= start && fired <= returned)
     {
         static const uint64_t ticksPerMs = TicksPerSecond() / 1000;
-        uint64_t armed = s_quantumArmedMs * ticksPerMs;
+        uint64_t armed = s_quantumArmedUs * ticksPerMs / 1000;
         q.timer[q.matched] = fired - start;
         q.over[q.matched] = fired - start > armed ? fired - start - armed : 0;
         q.notice[q.matched] = returned - fired;

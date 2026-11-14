@@ -134,9 +134,10 @@ IPv4 addresses exposed by the managed snapshot.
       (`NANO_POSIX_DEADLINE_QUANTUM`).
     - `timer`: the start of `Execute` to the quantum timer firing: the armed length (20 ms, or less
       with `deadline`) plus the timer thread's wake-up latency.
-    - `timer_over`: that wake-up latency alone, the firing past the armed length. It includes
-      starting the per-quantum `std::thread`, sleep overshoot, and waiting for a CPU at the CLR
-      thread's priority.
+    - `timer_over`: that wake-up latency alone, the firing past the armed length. Without
+      `NANO_POSIX_QNX_TIMER` it includes starting the per-quantum `std::thread`, sleep overshoot,
+      and waiting for a CPU at the CLR thread's priority; with it, the kernel timer's expiry and the
+      pulse to the receiver thread.
     - `notice`: the timer firing to `Execute` returning. The flag is checked at branches and
       between frames and native calls, not per opcode. So this is the rest of the stretch without
       a check, such as an allocation, including any GC that the allocation triggers.
@@ -190,22 +191,22 @@ IPv4 addresses exposed by the managed snapshot.
 
 `NANO_POSIX_DEADLINE_QUANTUM`
 - Default: `ON`
-- Ends a thread's quantum at the next timer or wait deadline, rounded up to whole ms, instead of
-  after a fixed 20 ms. Those deadlines are `Thread.Sleep`, timed waits and managed `Timer`s, as
-  cached by `ProcessTimer()`.
+- Ends a thread's quantum at the next timer or wait deadline instead of after a fixed 20 ms: rounded
+  up to whole ms, or exactly (at least 100 µs ahead) with `NANO_POSIX_QNX_TIMER`. Those deadlines
+  are `Thread.Sleep`, timed waits and managed `Timer`s, as cached by `ProcessTimer()`.
 - Why: a sleeping thread becomes ready only between quanta, so with fixed quanta and another thread
   busy, it woke up to 20 ms late.
 - The define is `NANOCLR_DEADLINE_QUANTUM`. At run time, the environment variable of the same name
   set to `0` restores fixed quanta, so one binary can be compared both ways.
 - Limits:
   - A deadline created by the running thread itself during its quantum (`Timer.Change`, a new
-    `Timer`, `ExecutionConstraint.Install`) is seen only at the end of that quantum, so the first callback can still be up to
-    20 ms late.
+    `Timer`, `ExecutionConstraint.Install`) is seen only at the end of that quantum, so the first
+    callback can still be up to 20 ms late.
   - Wake-up accuracy is still bounded by the host timer and by the next branch check.
 - Cost: shorter quanta mean more quantum boundaries. Each boundary costs one host thread for the
-  timer, a `ProcessTimer()` scan, and the incremental GC's per-boundary budget. A thread polling
-  with `Sleep(1)` gives every thread 1–2 ms quanta, so GC work at boundaries can take up to about
-  20× its usual share of the CPU.
+  timer (two `timer_settime` calls with `NANO_POSIX_QNX_TIMER`), a `ProcessTimer()` scan, and the
+  incremental GC's per-boundary budget. A thread polling with `Sleep(1)` gives every thread 1–2 ms
+  quanta, so GC work at boundaries can take up to about 20× its usual share of the CPU.
 
 `NANO_POSIX_ALLOC_FIT_HINTS`
 - Default: `ON`
@@ -221,6 +222,36 @@ IPv4 addresses exposed by the managed snapshot.
   verifies them (`[GCS] sweep check: fit hint ...`). Turn it off for comparisons; the cluster
   header is then as upstream.
 - Cost: about 270 bytes per cluster header (64-bit), and up to 32 pointer compares per allocation.
+
+`NANO_POSIX_QNX_TIMER` *(QNX only)*
+- Default: `ON`
+- Replaces the portable timing code with QNX kernel timers and pulses (`nanoCLR/QnxTimer.cpp`):
+  - the quantum timer and the HAL completion timer (`Time_SetCompare`) are two `CLOCK_MONOTONIC`
+    `timer_create` timers that send pulses to one receiver thread, instead of a new `std::thread`
+    per quantum and per completion timer;
+  - the idle wait (`Events_WaitForEvents`, all threads waiting) blocks in `MsgReceivePulse` with an
+    absolute `TimerTimeout`, and `Events_Set` wakes it with a pulse, instead of a condition
+    variable whose 10 ms re-check could overrun the deadline. It still re-checks the reboot and exit
+    flags every 10 ms;
+  - the quantum timer and the idle wait take the exact deadline (HAL time) instead of whole ms:
+    `Events_SetBoolTimerUntil` and `Events_WaitForEventsUntil` in `nanoPAL_Events.h`;
+  - the timers and the idle timeout are high-resolution: QNX fires ordinary timers on the clock
+    tick, so a sleeper that woke on a tick and sleeps whole ms was always nearly a tick late.
+- The receiver runs at the CLR thread's priority + 1 (the pulses carry it), so on a single CPU it
+  preempts the interpreter when a timer expires. If the process may not use a higher priority, it
+  runs at the CLR's own and loses that: under `SCHED_FIFO` on one CPU a busy thread's quantum then
+  ends only when it blocks, as with the portable timer thread. The idle channel has
+  `_NTO_CHF_FIXED_PRIORITY`, so a wake-up pulse never changes the CLR thread's priority.
+- The define is `NANOCLR_QNX_TIMER`. At run time:
+  - `NANOCLR_QNX_TIMER=0` restores the portable code, so one binary can be compared both ways;
+  - `NANOCLR_QNX_TIMER_TOLERANCE_NS=n` sets the timer tolerance (default 1000). Below the clock
+    tick it makes the timers high-resolution, which needs the `PROCMGR_AID_HIGH_RESOLUTION_TIMER`
+    ability (root has it); without it, a warning is printed and tick timers are used. `0` keeps
+    tick timers.
+  - Timing builds print `[QNX] kernel timer on, clr_priority=... timer_priority=... tolerance_ns=...`
+    to stdout at startup (not through the debug-output callback).
+- Independently of this option, the portable idle wait no longer sleeps past its deadline: it
+  waited in 10 ms steps and checked the deadline only after each.
 
 `NANO_POSIX_GC_HOST_MARK_STACK`
 - Default: `ON`

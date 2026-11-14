@@ -58,7 +58,7 @@ void GcTiming_ReportCompaction(uint32_t run, uint64_t start, uint64_t end, uint3
 // Quantum timing. The target's quantum timer calls GcTiming_QuantumFired just before it sets the expired flag;
 // ScheduleThreads reports each thread run: start before Execute, returned after it, end after the quantum-boundary
 // work (GC quantum hook and ProcessTimer). expired is the thread's quantum flag when Execute returned.
-void GcTiming_QuantumArmed(uint32_t milliseconds); // on the CLR thread, when Execute arms the timer
+void GcTiming_QuantumArmed(uint32_t microseconds); // on the CLR thread, when Execute arms the timer
 void GcTiming_QuantumFired();
 void GcTiming_ReportQuantum(uint64_t start, uint64_t returned, uint64_t end, bool expired);
 
