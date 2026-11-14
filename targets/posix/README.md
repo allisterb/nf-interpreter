@@ -143,7 +143,8 @@ IPv4 addresses exposed by the managed snapshot.
     - `boundary`: `Execute` returning to the end of `NANOCLR_GC_ON_QUANTUM()` and `ProcessTimer()`.
     - `gap`: the previous run's end to this one's start. It covers work between runs:
       - heap compaction, which runs outside `ScheduleThreads`;
-      - this batch line's own output, whose time is `last_emit_us` on the next line;
+      - this batch's own `[QNT]` and `[ALC]` output, whose time is `last_emit_us` on the next
+        `[QNT]` line;
       - idle waiting, when no thread was ready.
     - `short`: all runs in the batch that ended before their quantum. `short_boundary` and
       `short_gap` cover their first 512.
@@ -159,6 +160,33 @@ IPv4 addresses exposed by the managed snapshot.
       that `run` plus the gap before its own run, which is usually a `short_gap`. With
       `NANO_POSIX_DEADLINE_QUANTUM`, that boundary is at the deadline, so the lateness is about
       `timer_over` + `notice` + `boundary`.
+  - After each `[QNT]` line, an `[ALC]` line covers the managed-heap allocations
+    (`ExtractHeapBlocks`) since the previous one. Nested allocations count as part of the outer one.
+
+    ```text
+    [ALC] batch=5 allocs=937444 gc_allocs=0 clusters=1056126 nodes=1017909361 search_us=11845321 init_us=19286 wall_us=11909225 hist=323092/610173/2707/386/615/471 max_us=24198 max_nodes=283204 max_clusters=163 max_length=11 notice_hits=482 run_alloc_us=21785/37447/43101 run_alloc_max_us=14229/20898/24198 notice_alloc_us=3027/18084/19585
+    ```
+
+    (The 400 MiB linked GC probe, paced incremental, on the same VM: `nf_gcbench` run
+    `20261113-181807-alc400`.)
+
+    - An allocation's cost is the free-list search plus initialising the block (relinking the
+      remainder, the GC's allocate hook, including incremental stress steps, and zeroing for most),
+      summed over the cluster searches. `search_us`, `init_us` and `wall_us` are batch totals;
+      `wall` also covers any collection or on-demand sweep the allocation ran.
+    - `gc_allocs`: allocations that ran a full collection. `clusters` and `nodes`: cluster searches
+      (a failed retry of the last-used cluster counts twice) and free-list nodes visited.
+    - `hist`: allocations by cost, under 1 µs, 10 µs, 100 µs, 1 ms, 10 ms, and above.
+    - `max_*`: the costliest allocation, with its nodes, clusters and length in heap blocks
+      (`sizeof(CLR_RT_HeapBlock)` each).
+    - `run_alloc` and `run_alloc_max`: per expired quantum on the `[QNT]` line, the total and the
+      largest allocation cost since the previous run's report. That is mostly the run itself, plus
+      its boundary work and the gap before it.
+    - `notice_alloc`: per matched quantum, the time from the timer firing to the end of the
+      allocation it fired in, else 0; `notice_hits` counts the quanta where it fired in one.
+      Allocations that ran a full collection are left out, since `[GCT]` reports those. Compare it
+      with `notice`.
+    - Timing adds about five clock reads per allocation.
 
 `NANO_POSIX_DEADLINE_QUANTUM`
 - Default: `ON`

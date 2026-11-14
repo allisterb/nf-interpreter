@@ -110,6 +110,53 @@ QuantumSamples s_quantum;
 uint64_t s_lastQuantumEnd = 0;
 uint32_t s_quantumArmedMs = CLR_RT_Thread::c_TimeQuantum_Milliseconds;
 
+// Allocation cost is the free-list search plus block initialisation, summed over the clusters tried; wall time
+// also covers any collection or sweep the allocation ran. Totals are per quantum batch; the run and notice columns
+// line up with the quantum samples.
+const uint32_t c_AllocBuckets = 6; // cost <1 us, <10 us, <100 us, <1 ms, <10 ms, >=10 ms
+
+struct AllocSamples
+{
+    uint64_t runCost[c_QuantumBatch];     // allocator cost since the previous report: the expired run, its boundary
+                                          // and the gap before it
+    uint64_t runMax[c_QuantumBatch];      // the costliest of those allocations
+    uint64_t noticeAlloc[c_QuantumBatch]; // matched quanta: time from the timer firing to the end of the allocation
+                                          // it fired in, else 0
+    uint32_t hist[c_AllocBuckets];
+    uint32_t noticeHits; // matched quanta whose timer fired inside an allocation
+    uint64_t allocs;
+    uint64_t gcAllocs; // allocations that ran a full collection
+    uint64_t nodes;
+    uint64_t clusters;
+    uint64_t searchTicks;
+    uint64_t initTicks;
+    uint64_t wallTicks;
+    uint64_t maxCost;
+    uint32_t maxNodes;
+    uint32_t maxClusters;
+    uint32_t maxLength;
+};
+
+// The allocation in progress.
+struct PendingAlloc
+{
+    uint32_t depth;
+    uint64_t start;
+    uint64_t search;
+    uint64_t init;
+    uint32_t nodes;
+    uint32_t clusters;
+    uint32_t length;
+    bool gc;
+};
+
+AllocSamples s_alloc;
+PendingAlloc s_pending;
+uint64_t s_runCost = 0; // since the last ReportQuantum
+uint64_t s_runMax = 0;
+uint64_t s_allocFiredStamp = 0; // the timer stamp the last allocation straddled, and the allocation's remainder
+uint64_t s_allocFiredTail = 0;
+
 // Appends " name_us=median/p99/max" for the first n values, sorting them in place.
 int AppendDistribution(char *out, size_t capacity, const char *name, uint64_t *values, uint32_t n)
 {
@@ -130,6 +177,55 @@ int AppendDistribution(char *out, size_t capacity, const char *name, uint64_t *v
         ToNs(values[n / 2]) / 1000,
         ToNs(values[(uint64_t)n * 99 / 100]) / 1000,
         ToNs(values[n - 1]) / 1000);
+}
+
+void EmitAllocBatch(uint32_t batch, uint32_t runs, uint32_t matched)
+{
+    AllocSamples &a = s_alloc;
+    char line[704];
+    size_t used = 0;
+    auto append = [&](int n) {
+        if (n > 0)
+        {
+            size_t room = sizeof(line) - 1 - used;
+            used += (size_t)n < room ? (size_t)n : room;
+        }
+    };
+
+    append(std::snprintf(
+        line,
+        sizeof(line),
+        "[ALC] batch=%" PRIu32 " allocs=%" PRIu64 " gc_allocs=%" PRIu64 " clusters=%" PRIu64 " nodes=%" PRIu64
+        " search_us=%" PRIu64 " init_us=%" PRIu64 " wall_us=%" PRIu64 " hist=%" PRIu32 "/%" PRIu32 "/%" PRIu32
+        "/%" PRIu32 "/%" PRIu32 "/%" PRIu32 " max_us=%" PRIu64 " max_nodes=%" PRIu32 " max_clusters=%" PRIu32
+        " max_length=%" PRIu32 " notice_hits=%" PRIu32,
+        batch,
+        a.allocs,
+        a.gcAllocs,
+        a.clusters,
+        a.nodes,
+        ToNs(a.searchTicks) / 1000,
+        ToNs(a.initTicks) / 1000,
+        ToNs(a.wallTicks) / 1000,
+        a.hist[0],
+        a.hist[1],
+        a.hist[2],
+        a.hist[3],
+        a.hist[4],
+        a.hist[5],
+        ToNs(a.maxCost) / 1000,
+        a.maxNodes,
+        a.maxClusters,
+        a.maxLength,
+        a.noticeHits));
+    append(AppendDistribution(line + used, sizeof(line) - used, "run_alloc", a.runCost, runs));
+    append(AppendDistribution(line + used, sizeof(line) - used, "run_alloc_max", a.runMax, runs));
+    append(AppendDistribution(line + used, sizeof(line) - used, "notice_alloc", a.noticeAlloc, matched));
+    append(std::snprintf(line + used, sizeof(line) - used, "\r\n"));
+
+    Emit(line, (int)used, sizeof(line));
+
+    a = {};
 }
 
 void EmitQuantumBatch()
@@ -173,6 +269,7 @@ void EmitQuantumBatch()
     append(std::snprintf(line + used, sizeof(line) - used, "\r\n"));
 
     Emit(line, (int)used, sizeof(line));
+    EmitAllocBatch(q.batch, q.count, q.matched);
 
     q.count = q.matched = q.deadline = q.gaps = q.shortCount = q.shortGaps = 0;
     q.batch++;
@@ -200,6 +297,11 @@ void GcTiming_ReportCollection(
     uint32_t heapBytes)
 {
     auto span = [&](int i) { return ToNs(stamps[i] - stamps[i - 1]); };
+
+    if (s_pending.depth > 0)
+    {
+        s_pending.gc = true;
+    }
 
     char line[448];
     int n = std::snprintf(
@@ -255,12 +357,78 @@ void GcTiming_QuantumFired()
     std::atomic_thread_fence(std::memory_order_release);
 }
 
+void GcTiming_AllocBegin(uint32_t length)
+{
+    if (s_pending.depth++ == 0)
+    {
+        s_pending = {1, GcTiming_Now(), 0, 0, 0, 0, length, false};
+    }
+}
+
+void GcTiming_AllocEnd()
+{
+    if (s_pending.depth == 0 || --s_pending.depth != 0)
+    {
+        return;
+    }
+
+    const PendingAlloc &p = s_pending;
+    AllocSamples &a = s_alloc;
+    uint64_t end = GcTiming_Now();
+    uint64_t cost = p.search + p.init;
+    uint64_t ns = ToNs(cost);
+    uint32_t bucket = ns < 1000 ? 0 : ns < 10000 ? 1 : ns < 100000 ? 2 : ns < 1000000 ? 3 : ns < 10000000 ? 4 : 5;
+
+    a.allocs++;
+    a.gcAllocs += p.gc;
+    a.nodes += p.nodes;
+    a.clusters += p.clusters;
+    a.searchTicks += p.search;
+    a.initTicks += p.init;
+    a.wallTicks += end - p.start;
+    a.hist[bucket]++;
+
+    if (cost > a.maxCost)
+    {
+        a.maxCost = cost;
+        a.maxNodes = p.nodes;
+        a.maxClusters = p.clusters;
+        a.maxLength = p.length;
+    }
+
+    s_runCost += cost;
+    if (cost > s_runMax)
+    {
+        s_runMax = cost;
+    }
+
+    // A collection inside the allocation is reported as a pause, so leave it out of the notice attribution.
+    uint64_t fired = s_quantumFired.load(std::memory_order_relaxed);
+    if (!p.gc && fired >= p.start && fired <= end)
+    {
+        s_allocFiredStamp = fired;
+        s_allocFiredTail = end - fired;
+    }
+}
+
+void GcTiming_ReportExtract(uint64_t start, uint64_t searched, uint64_t end, uint32_t nodes)
+{
+    PendingAlloc &p = s_pending;
+
+    p.search += searched - start;
+    p.init += end - searched;
+    p.nodes += nodes;
+    p.clusters++;
+}
+
 void GcTiming_ReportQuantum(uint64_t start, uint64_t returned, uint64_t end, bool expired)
 {
     QuantumSamples &q = s_quantum;
     uint64_t lastEnd = s_lastQuantumEnd;
     bool hasGap = lastEnd != 0 && lastEnd <= start;
     s_lastQuantumEnd = end;
+    uint64_t runCost = s_runCost, runMax = s_runMax;
+    s_runCost = s_runMax = 0;
 
     if (!expired)
     {
@@ -278,6 +446,8 @@ void GcTiming_ReportQuantum(uint64_t start, uint64_t returned, uint64_t end, boo
 
     q.run[q.count] = end - start;
     q.boundary[q.count] = end - returned;
+    s_alloc.runCost[q.count] = runCost;
+    s_alloc.runMax[q.count] = runMax;
     q.count++;
     if (s_quantumArmedMs < CLR_RT_Thread::c_TimeQuantum_Milliseconds)
     {
@@ -298,6 +468,9 @@ void GcTiming_ReportQuantum(uint64_t start, uint64_t returned, uint64_t end, boo
         q.timer[q.matched] = fired - start;
         q.over[q.matched] = fired - start > armed ? fired - start - armed : 0;
         q.notice[q.matched] = returned - fired;
+        bool inAlloc = s_allocFiredStamp == fired;
+        s_alloc.noticeAlloc[q.matched] = inAlloc ? s_allocFiredTail : 0;
+        s_alloc.noticeHits += inAlloc;
         q.matched++;
     }
 

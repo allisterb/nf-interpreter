@@ -62,6 +62,28 @@ void GcTiming_QuantumArmed(uint32_t milliseconds); // on the CLR thread, when Ex
 void GcTiming_QuantumFired();
 void GcTiming_ReportQuantum(uint64_t start, uint64_t returned, uint64_t end, bool expired);
 
+// Allocation timing. ExtractHeapBlocks brackets each allocation (length in heap blocks) with a GcTimingAllocScope;
+// nested allocations fold into the outer one. CLR_RT_HeapCluster::ExtractBlocks reports each cluster search: start,
+// after the free-list search, at the end, and the free-list nodes visited. Its corrupt-list early returns are not
+// reported.
+void GcTiming_AllocBegin(uint32_t length);
+void GcTiming_AllocEnd();
+void GcTiming_ReportExtract(uint64_t start, uint64_t searched, uint64_t end, uint32_t nodes);
+
+struct GcTimingAllocScope
+{
+    explicit GcTimingAllocScope(uint32_t length)
+    {
+        GcTiming_AllocBegin(length);
+    }
+    ~GcTimingAllocScope()
+    {
+        GcTiming_AllocEnd();
+    }
+    GcTimingAllocScope(const GcTimingAllocScope &) = delete;
+    GcTimingAllocScope &operator=(const GcTimingAllocScope &) = delete;
+};
+
 #endif // NANOCLR_GC_TIMING
 
 #endif // NANOCLR_GCTIMING_H

@@ -2131,6 +2131,10 @@ CLR_RT_HeapBlock *CLR_RT_ExecutionEngine::ExtractHeapBlocks(
     }
 #endif
 
+#if defined(NANOCLR_GC_TIMING)
+    GcTimingAllocScope timingScope(length);
+#endif
+
 #if defined(NANOCLR_FORCE_GC_BEFORE_EVERY_ALLOCATION)
     if (m_heapState != c_HeapState_UnderGC)
     {

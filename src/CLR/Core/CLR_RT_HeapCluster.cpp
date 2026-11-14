@@ -5,6 +5,10 @@
 //
 #include "Core.h"
 
+#if defined(NANOCLR_GC_TIMING)
+#include <nanoCLR_GcTiming.h>
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void CLR_RT_HeapCluster::HeapCluster_Initialize(CLR_UINT32 size, CLR_UINT32 blockSize)
@@ -81,6 +85,10 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
     NATIVE_PROFILE_CLR_CORE();
     CLR_RT_HeapBlock_Node *res = nullptr;
     CLR_UINT32 available = 0;
+#if defined(NANOCLR_GC_TIMING)
+    const uint64_t timingStart = GcTiming_Now();
+    uint32_t timingNodes = 0;
+#endif
 
     m_freeList.ValidateList();
 
@@ -88,6 +96,9 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
     {
         NANOCLR_FOREACH_NODE_BACKWARD(CLR_RT_HeapBlock_Node, ptr, m_freeList)
         {
+#if defined(NANOCLR_GC_TIMING)
+            timingNodes++;
+#endif
             available = ptr->DataSize();
 
             if (available >= length)
@@ -102,6 +113,9 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
     {
         NANOCLR_FOREACH_NODE(CLR_RT_HeapBlock_Node, ptr, m_freeList)
         {
+#if defined(NANOCLR_GC_TIMING)
+            timingNodes++;
+#endif
             available = ptr->DataSize();
 
             if (available >= length)
@@ -120,6 +134,10 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
         }
         NANOCLR_FOREACH_NODE_END();
     }
+
+#if defined(NANOCLR_GC_TIMING)
+    const uint64_t timingSearched = GcTiming_Now();
+#endif
 
     if (res)
     {
@@ -198,6 +216,10 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
     }
 
     m_freeList.ValidateList();
+
+#if defined(NANOCLR_GC_TIMING)
+    GcTiming_ReportExtract(timingStart, timingSearched, GcTiming_Now(), timingNodes);
+#endif
 
     return res;
 }
