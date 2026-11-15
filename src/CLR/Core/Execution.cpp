@@ -1729,6 +1729,8 @@ HRESULT CLR_RT_ExecutionEngine::ScheduleThreads(int maxContextSwitch)
             // Runs the tread until expiration of its quantum or until thread is blocked.
             hr = th->Execute();
         }
+        // Read before PutInProperList, which can free a terminated thread.
+        const bool deadlineEnded = th->m_timeQuantumExpired && th->m_timeQuantumShortened;
 #if defined(NANOCLR_GC_TIMING)
         uint64_t quantumReturned = GcTiming_Now();
         bool quantumExpired = th->m_timeQuantumExpired;
@@ -1754,7 +1756,7 @@ HRESULT CLR_RT_ExecutionEngine::ScheduleThreads(int maxContextSwitch)
         Watchdog_Reset();
 
         PutInProperList(th);
-        NANOCLR_GC_ON_QUANTUM()
+        NANOCLR_GC_ON_QUANTUM(deadlineEnded)
 
         (void)ProcessTimer();
 #if defined(NANOCLR_GC_TIMING)

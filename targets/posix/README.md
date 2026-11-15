@@ -359,6 +359,18 @@ IPv4 addresses exposed by the managed snapshot.
       `orphans_kept` and `alive_kept` should be 0. `orphans_kept` counts slots cut off an object by a
       truncation the bitmaps missed. `alive_kept` counts kept non-event blocks still carrying
       `HB_Alive`, which no bitmap sweep clears.
+  - **Deadline boundaries** (`NANOCLR_GC_INCREMENTAL_DEFER`, default on; `0` turns it off). With
+    `NANO_POSIX_DEADLINE_QUANTUM`, a quantum that a timer or wait deadline cut short ends because a
+    thread is due, and that thread is made ready only after the boundary's GC work. So such a
+    boundary defers its GC work (slice, sweep step, cycle start, final pause and `[GCC]` print) to
+    the next boundary. That one comes after the woken thread has run, and does both shares. No two
+    boundaries in a row defer, so a deadline boundary right after a deferred one does double work.
+    Under the paced GC this cut a sleeper's median lateness from 0.40 ms to 43 µs (p99 0.45 ms to
+    about 0.1 ms) at both 40 and 400 MiB, with the collector itself unchanged: the same cycles,
+    sweep span, aborts (none) and throughput. A first version dropped the deferred share instead;
+    each sweep then took a boundary longer, and a 40 MiB heap ran full enough for alternate cycles to
+    abort. `[GCC]` lines count the deferred boundaries in `deferred`; `sweep_steps`, `slices` and
+    their `*_max_us` count shares, so a boundary that does both can take twice `step_max_us`.
   - **Requested collections:** a collection requested mid-cycle, for example on allocation failure
     or `GC.Collect`, discards the cycle and marks stop-the-world. This gives the exact result: the
     cycle's snapshot would keep everything reachable at its start or allocated since. Such a cycle
@@ -387,7 +399,7 @@ IPv4 addresses exposed by the managed snapshot.
       aborts the cycle. That collection is a stop-the-world one, which costs far more than the print.
 
     ```text
-    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=... fallback_clusters=... sweep_steps=... step_max_us=... sweep_span_ms=... swept_on_alloc=... catchup_steps=... trigger_wait_us=... forced=none forced_clusters=0 forced_us=0 used_bytes=...
+    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=... fallback_clusters=... sweep_steps=... step_max_us=... sweep_span_ms=... swept_on_alloc=... catchup_steps=... trigger_wait_us=... forced=none forced_clusters=0 forced_us=0 used_bytes=... deferred=...
     ```
 
     - `final_mark_us` is the final pause's marking: draining what is still grey, the finalizer
@@ -419,6 +431,8 @@ IPv4 addresses exposed by the managed snapshot.
       sweep step. `forced_clusters` and `forced_us` sum all of them; `none` if nothing did.
     - `used_bytes` is the heap in use when a sweep after the pause ends, and 0 when the sweep ended
       in the pause (the `[GCT]` line is exact then).
+    - `deferred` counts the boundaries, from the cycle's start to the end of its sweep, whose work
+      was deferred to the next boundary because a deadline ended the quantum.
     - The line is kept when the sweep ends and printed at the next quantum boundary.
     - `total_ms` runs from the initial pause to the end of the sweep, wherever it ends.
     - Free memory (`m_freeBytes`) stays at the previous collection's value until the sweep ends,

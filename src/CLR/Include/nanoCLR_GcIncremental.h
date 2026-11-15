@@ -107,8 +107,10 @@ CLR_RT_HeapBlock *GcIncremental_OnAllocationFailed(CLR_UINT32 dataType, CLR_UINT
 // pause (GC.Collect or an allocation failure mid-cycle discards the cycle for the exact stop-the-world result).
 bool GcIncremental_FinishCycle();
 // A thread quantum has ended: print the last cycle's pending "[GCC]" line, then run a sweep step, start a cycle, run a
-// mark slice, or request the final pause.
-void GcIncremental_OnQuantum();
+// mark slice, or request the final pause. deadline: a timer or wait deadline ended the quantum early; any such work
+// moves to the next boundary, which does both shares (unless the previous boundary's moved too, or
+// NANOCLR_GC_INCREMENTAL_DEFER=0).
+void GcIncremental_OnQuantum(bool deadline);
 // Heap compaction is about to move objects: abort any active cycle, and finish any sweep.
 void GcIncremental_OnCompaction();
 
@@ -153,7 +155,7 @@ void GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_MARKED()             GcIncremental_OnMarked();
 #define NANOCLR_GC_ON_SWEEP_HEAP()         if (!GcIncremental_OnSweepHeap())
 #define NANOCLR_GC_ON_SWEPT()              GcIncremental_OnSwept();
-#define NANOCLR_GC_ON_QUANTUM()            GcIncremental_OnQuantum();
+#define NANOCLR_GC_ON_QUANTUM(deadline)    GcIncremental_OnQuantum(deadline);
 #define NANOCLR_GC_ON_COMPACTION()         GcIncremental_OnCompaction();
 #define NANOCLR_GC_MARK()                                                                                              \
     {                                                                                                                  \
@@ -195,7 +197,7 @@ void GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_MARKED()
 #define NANOCLR_GC_ON_SWEEP_HEAP()
 #define NANOCLR_GC_ON_SWEPT()
-#define NANOCLR_GC_ON_QUANTUM()
+#define NANOCLR_GC_ON_QUANTUM(deadline) (void)(deadline);
 #define NANOCLR_GC_ON_COMPACTION()
 #define NANOCLR_GC_MARK()                        Mark();
 #define NANOCLR_GC_COMPUTE_ALIVE_VS_DEAD_RATIO() Heap_ComputeAliveVsDeadRatio();

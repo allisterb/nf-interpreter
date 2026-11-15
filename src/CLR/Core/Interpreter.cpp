@@ -634,7 +634,8 @@ bool CLR_RT_Thread::FindEhBlock(
 // A sleeper becomes ready only in ProcessTimer, between quanta, so end the quantum at the next timer or wait deadline
 // (ProcessTimer's cache) instead of up to 20 ms later. NANOCLR_DEADLINE_QUANTUM=0 restores fixed quanta.
 // deadline: the same end as a HAL time, at least 100 us away, for a PAL that can arm an absolute timer.
-static CLR_UINT32 QuantumMilliseconds(CLR_UINT64 &deadline)
+// shortened: the quantum ends at the deadline, before its full length.
+static CLR_UINT32 QuantumMilliseconds(CLR_UINT64 &deadline, bool &shortened)
 {
     static const bool enabled = [] {
         const char *value = getenv("NANOCLR_DEADLINE_QUANTUM");
@@ -646,6 +647,7 @@ static CLR_UINT32 QuantumMilliseconds(CLR_UINT64 &deadline)
     const CLR_INT64 now = (CLR_INT64)HAL_Time_CurrentTime();
 
     deadline = (CLR_UINT64)(now + quantum);
+    shortened = false;
     if (!enabled || !ee.m_timerCache)
     {
         return CLR_RT_Thread::c_TimeQuantum_Milliseconds;
@@ -658,6 +660,7 @@ static CLR_UINT32 QuantumMilliseconds(CLR_UINT64 &deadline)
     }
 
     deadline = (CLR_UINT64)(now + (left < minimum ? minimum : left));
+    shortened = true;
 
     // Round up: waking early would only cost an extra boundary.
     return left <= 0 ? 1
@@ -695,7 +698,7 @@ HRESULT CLR_RT_Thread::Execute()
 
 #if defined(NANOCLR_DEADLINE_QUANTUM)
     CLR_UINT64 quantumDeadline;
-    const CLR_UINT32 quantumMs = QuantumMilliseconds(quantumDeadline);
+    const CLR_UINT32 quantumMs = QuantumMilliseconds(quantumDeadline, m_timeQuantumShortened);
 #else
     const CLR_UINT32 quantumMs = CLR_RT_Thread::c_TimeQuantum_Milliseconds;
 #endif

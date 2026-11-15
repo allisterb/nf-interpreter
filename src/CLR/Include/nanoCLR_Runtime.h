@@ -3585,6 +3585,7 @@ struct CLR_RT_Thread : public CLR_RT_ObjectToEvent_Destination // EVENT HEAP - N
     CLR_UINT32 m_flags;
     int m_executionCounter;
     volatile bool m_timeQuantumExpired;
+    bool m_timeQuantumShortened; // last quantum armed to end at a deadline, short of its full length
 
     CLR_RT_HeapBlock_Delegate *m_dlg;    // OBJECT HEAP - DO RELOCATION -
     CLR_RT_HeapBlock m_currentException; // OBJECT HEAP - DO RELOCATION -

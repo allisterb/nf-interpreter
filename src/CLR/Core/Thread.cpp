@@ -255,6 +255,7 @@ HRESULT CLR_RT_Thread::CreateInstance(int pid, int priority, CLR_RT_Thread *&th,
         th->m_flags = flags;                                // CLR_UINT32                 m_flags;
         th->m_executionCounter = 0;                         // int                        m_executionCounter;
         th->m_timeQuantumExpired = false;                   // bool                       m_timeQuantumExpired;
+        th->m_timeQuantumShortened = false;                 // bool                       m_timeQuantumShortened;
                                                             //
         th->m_dlg = nullptr;                                // CLR_RT_HeapBlock_Delegate* m_dlg;
         th->m_currentException.SetObjectReference(nullptr); // CLR_RT_HeapBlock           m_currentException;
