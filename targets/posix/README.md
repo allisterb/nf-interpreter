@@ -266,6 +266,31 @@ IPv4 addresses exposed by the managed snapshot.
   (10 MiB heap) and 2.25 s (40 MiB heap) to 5–9 ms (medians).
 - `OFF` restores the upstream behaviour.
 
+`NANO_POSIX_GC_NOGC_REGION`
+- Default: `ON`
+- No-GC regions, and the native side of the QFlat.Device assembly (qflat `src/QFlat.Device`) that exposes them:
+  `GcPolicy.TryStartNoGcRegion(bytes)`, `EndNoGcRegion()`, `InNoGcRegion` and `GcWorkCount`.
+- **What a region stops:** while a region is active, no GC work of any kind runs on any managed thread. That covers:
+  - stop-the-world collection;
+  - incremental cycle starts, slices, pace steps, sweep steps and final pauses;
+  - idle work;
+  - heap compaction, which is deferred to the next safe point after the region ends.
+- **Start:** `TryStartNoGcRegion` collects, runs pending finalizers, finishes any sweep, and starts the
+  region only if `bytes` are free.
+- **Allocation:** inside a region allocation never collects.
+  - A full heap throws the preallocated `OutOfMemoryException`, whose `Message` ("Out of memory.") is set at
+    startup, so throwing and reading it allocate nothing.
+  - End the region in the handler before allocating there.
+- **Budget:** soft. Allocation past `bytes` still succeeds while memory lasts, and `EndNoGcRegion()` returns
+  false. It also returns false if a requested collection (`GC.Collect`, `GC.GetTotalMemory`, or a debug forced
+  GC) ended the region early.
+- `NANOCLR_GC_NOGC_TRACE=1` prints a `[GCN]` line at each start and end.
+- On QEMU, with a thread allocating about 8 KB/ms, 20 regions of 50 ms ran no GC work under the `batch`,
+  `lowlatency` and `interactive` profiles. Without a region, `lowlatency` ran 28 units of GC work per 50 ms.
+  Filling a 10 MiB heap ran 3–7 units of GC work before the OOM outside a region, and none inside one. Test:
+  qflat `tools/nf_nogc_test.py`.
+- `OFF` removes the hooks and the assembly.
+
 `NANO_POSIX_GC_INCREMENTAL`
 - Default: `OFF`
 - Experimental incremental, snapshot-at-the-beginning (SATB) collector. When `ON`, the build contains:

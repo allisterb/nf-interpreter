@@ -370,6 +370,17 @@ if(NANO_POSIX_GC_INCREMENTAL)
     target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_GC_INCREMENTAL)
 endif()
 
+# No-GC regions, and the QFlat.Device native assembly (qflat src/QFlat.Device) that exposes them as GcPolicy.
+if(NANO_POSIX_GC_NOGC_REGION)
+    target_sources(nanoFramework.nanoCLR PRIVATE
+        ${REPO_ROOT}/src/CLR/Core/GarbageCollector_NoGcRegion.cpp
+        ${REPO_ROOT}/src/QFlat.Device/QFlat_Device.cpp
+        ${REPO_ROOT}/src/QFlat.Device/QFlat_Device_QFlat_Device_GcPolicy.cpp
+    )
+    target_include_directories(nanoFramework.nanoCLR PRIVATE ${REPO_ROOT}/src/QFlat.Device)
+    target_compile_definitions(nanoFramework.nanoCLR PRIVATE NANOCLR_GC_NOGC_REGION)
+endif()
+
 # Hide all symbols by default; only NANOCLRNATIVE_API-marked symbols are exported.
 target_compile_options(nanoFramework.nanoCLR PRIVATE -fvisibility=hidden)
 

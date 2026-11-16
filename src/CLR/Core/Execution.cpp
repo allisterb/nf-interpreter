@@ -397,6 +397,9 @@ void CLR_RT_ExecutionEngine::ExecutionConstraint_Resume()
 CLR_UINT32 CLR_RT_ExecutionEngine::PerformGarbageCollection()
 {
     NATIVE_PROFILE_CLR_CORE();
+    // A collection requested inside a no-GC region (GC.Collect, GC.GetTotalMemory) ends the region.
+    NANOCLR_GC_NOGC_ON_COLLECT()
+    NANOCLR_GC_COUNT_WORK()
     m_heapState = c_HeapState_UnderGC;
 
     CLR_UINT32 freeMem = g_CLR_RT_GarbageCollector.ExecuteGarbageCollection();
@@ -424,6 +427,14 @@ void CLR_RT_ExecutionEngine::PerformHeapCompaction()
     if (CLR_EE_DBG_IS(NoCompaction))
         return;
 
+    // Inside a no-GC region compaction waits for the region's end, at the next safe point.
+    if (NANOCLR_GC_NOGC_ACTIVE())
+    {
+        CLR_EE_SET(Compaction_Pending);
+        return;
+    }
+
+    NANOCLR_GC_COUNT_WORK()
     g_CLR_RT_GarbageCollector.ExecuteCompaction();
 
     CLR_EE_CLR(Compaction_Pending);
@@ -700,7 +711,7 @@ HRESULT CLR_RT_ExecutionEngine::Execute(wchar_t *entryPointArgs, int maxContextS
         }
 #endif // #if defined(NANOCLR_ENABLE_SOURCELEVELDEBUGGING)
 
-        if (CLR_EE_IS(Compaction_Pending))
+        if (CLR_EE_IS(Compaction_Pending) && !NANOCLR_GC_NOGC_ACTIVE())
         {
             PerformHeapCompaction();
             _ASSERTE(FIMPLIES(CLR_EE_DBG_IS_NOT(NoCompaction), CLR_EE_IS_NOT(Compaction_Pending)));
@@ -2150,6 +2161,9 @@ CLR_RT_HeapBlock *CLR_RT_ExecutionEngine::ExtractHeapBlocks(
         PerformGarbageCollection();
     }
 #endif
+
+    // Inside a no-GC region a failed allocation returns null rather than collect.
+    NANOCLR_GC_NOGC_NO_COLLECT(flags)
 
     for (int phase = 0;; phase++)
     {

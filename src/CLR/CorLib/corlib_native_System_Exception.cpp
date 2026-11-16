@@ -123,7 +123,9 @@ HRESULT Library_corlib_native_System_Exception::CreateInstance(
 
     _ASSERTE(CLR_RT_ExecutionEngine::IsInstanceOf(cls, g_CLR_RT_WellKnownTypes.Exception));
 
-    if (FAILED(hr = g_CLR_RT_ExecutionEngine.NewObjectFromIndex(ref, cls)))
+    // An OOM inside a no-GC region throws the preallocated exception: it allocates nothing, and its Message is preset.
+    if ((NANOCLR_GC_NOGC_ACTIVE() && hrIn == CLR_E_OUT_OF_MEMORY) ||
+        FAILED(hr = g_CLR_RT_ExecutionEngine.NewObjectFromIndex(ref, cls)))
     {
 #if defined(NANOCLR_APPDOMAINS)
         ref.SetObjectReference(g_CLR_RT_ExecutionEngine.GetCurrentAppDomain()->m_outOfMemoryException);

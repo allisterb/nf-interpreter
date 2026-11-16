@@ -8114,6 +8114,13 @@ HRESULT CLR_RT_TypeSystem::PrepareForExecution()
             g_CLR_RT_ExecutionEngine.NewObjectFromIndex(exception, g_CLR_RT_WellKnownTypes.OutOfMemoryException));
 
         g_CLR_RT_ExecutionEngine.m_outOfMemoryException = exception.Dereference();
+
+#if defined(NANOCLR_GC_NOGC_REGION)
+        // Rooted above first. A preset Message, so reading it on a full heap does not allocate.
+        NANOCLR_CHECK_HRESULT(CLR_RT_HeapBlock_String::CreateInstance(
+            g_CLR_RT_ExecutionEngine.m_outOfMemoryException[Library_corlib_native_System_Exception::FIELD___message],
+            "Out of memory."));
+#endif
     }
 #endif
 

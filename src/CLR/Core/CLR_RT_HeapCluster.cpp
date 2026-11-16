@@ -301,6 +301,7 @@ CLR_RT_HeapBlock *CLR_RT_HeapCluster::ExtractBlocks(CLR_UINT32 dataType, CLR_UIN
 
         res->SetDataId(CLR_RT_HEAPBLOCK_RAW_ID(dataType, flags, length));
         NANOCLR_GC_ON_ALLOCATE(res, flags)
+        NANOCLR_GC_NOGC_ON_EXTRACTED(length)
 
         if (flags & CLR_RT_HeapBlock::HB_InitializeToZero)
         {

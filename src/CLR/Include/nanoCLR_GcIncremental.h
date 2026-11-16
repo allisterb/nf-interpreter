@@ -118,6 +118,8 @@ void GcIncremental_OnQuantum(bool deadline);
 bool GcIncremental_OnIdle(CLR_INT64 timeout);
 // Heap compaction is about to move objects: abort any active cycle, and finish any sweep.
 void GcIncremental_OnCompaction();
+// A no-GC region is starting: abort any active cycle, and finish any sweep, so no incremental work is left.
+void GcIncremental_OnNoGcRegionStart();
 
 #define NANOCLR_GC_PRE_WRITE(slot)                                                                                     \
     {                                                                                                                  \
@@ -163,6 +165,7 @@ void GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_QUANTUM(deadline)    GcIncremental_OnQuantum(deadline);
 #define NANOCLR_GC_ON_IDLE(timeout)        GcIncremental_OnIdle(timeout)
 #define NANOCLR_GC_ON_COMPACTION()         GcIncremental_OnCompaction();
+#define NANOCLR_GC_ON_NOGC_START()         GcIncremental_OnNoGcRegionStart();
 #define NANOCLR_GC_MARK()                                                                                              \
     {                                                                                                                  \
         if (!GcIncremental_FinishCycle())                                                                              \
@@ -206,6 +209,7 @@ void GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_QUANTUM(deadline) (void)(deadline);
 #define NANOCLR_GC_ON_IDLE(timeout)     ((void)(timeout), false)
 #define NANOCLR_GC_ON_COMPACTION()
+#define NANOCLR_GC_ON_NOGC_START()
 #define NANOCLR_GC_MARK()                        Mark();
 #define NANOCLR_GC_COMPUTE_ALIVE_VS_DEAD_RATIO() Heap_ComputeAliveVsDeadRatio();
 #define NANOCLR_GC_ON_ALLOCATION_FAILED(hb, dataType, flags, length)

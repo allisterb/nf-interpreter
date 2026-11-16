@@ -783,6 +783,7 @@ CLR_UINT32 TotalBytes();
 void StartCycle()
 {
     _ASSERTE(!s_sweeping);
+    NANOCLR_GC_COUNT_WORK()
 
     const size_t stale = s_stress ? FirstCycleBit() : c_noBit;
 
@@ -869,6 +870,7 @@ void AbortCycle(const char *reason)
 // One timed mark slice. Returns true when no grey work is left.
 bool RunSlice()
 {
+    NANOCLR_GC_COUNT_WORK()
     uint64_t start = NowNs();
     bool done = Drain(s_sliceSlots);
     uint64_t elapsed = NowNs() - start;
@@ -888,6 +890,8 @@ bool RunSlice()
 // final pause at the next quantum boundary.
 void PaceStep()
 {
+    NANOCLR_GC_COUNT_WORK()
+
     // Grey work is left past the estimate W (the live set grew): double it, up to the heap in use, and catch up.
     auto reestimate = []() {
         if (s_cycle.scannedSlots >= s_paceWork && s_paceWork < s_paceUsed &&
@@ -2049,6 +2053,7 @@ void RecordForced(const char *reason, CLR_UINT32 clusters, uint64_t ns)
 // Sweeps every cluster left, at once.
 void FinishSweep(const char *reason)
 {
+    NANOCLR_GC_COUNT_WORK()
     const uint64_t start = NowNs();
     CLR_UINT32 clusters = 1;
 
@@ -2065,6 +2070,7 @@ void FinishSweep(const char *reason)
 // long as the last would still fit the budget.
 void SweepStep(uint64_t budgetNs)
 {
+    NANOCLR_GC_COUNT_WORK()
     const uint64_t start = NowNs();
     uint64_t now = start;
     uint64_t last;
@@ -2185,7 +2191,8 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
     // still unzeroed, and before its colour is decided, so a cycle started here allocates it black too: nothing
     // references it yet, and the store that will (a root write, or a field of an old object, whose barrier shades only
     // the old value) cannot shade it.
-    if (s_stressEvery != 0 && ++s_stressCount >= s_stressEvery)
+    // A no-GC region runs neither; s_allocatedSinceGc keeps counting, so a cycle starts soon after the region ends.
+    if (s_stressEvery != 0 && !NANOCLR_GC_NOGC_ACTIVE() && ++s_stressCount >= s_stressEvery)
     {
         s_stressCount = 0;
         StressStep();
@@ -2193,7 +2200,7 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
 
     // Allocation pacing, at the same point and for the same reasons as stress mode: a cycle started here allocates this
     // block black.
-    if (s_pacePercent != 0 && s_incremental &&
+    if (s_pacePercent != 0 && s_incremental && !NANOCLR_GC_NOGC_ACTIVE() &&
         g_CLR_RT_ExecutionEngine.m_heapState != CLR_RT_ExecutionEngine::c_HeapState_UnderGC)
     {
         if (s_cycleActive)
@@ -2713,13 +2720,18 @@ static void QuantumWork()
 // QuantumWork() would do something.
 static bool QuantumWorkDue()
 {
-    return s_valid && s_incremental &&
+    return s_valid && s_incremental && !NANOCLR_GC_NOGC_ACTIVE() &&
            (s_reportPending || s_cycleActive || s_sweeping ||
             (s_allocatedSinceGc >= s_triggerSlots && !CLR_EE_IS(Compaction_Pending)));
 }
 
 void GcIncremental_OnQuantum(bool deadline)
 {
+    if (NANOCLR_GC_NOGC_ACTIVE())
+    {
+        return;
+    }
+
     // ProcessTimer runs after this, so work here delays the thread whose deadline ended the quantum. Skip it, never
     // twice in a row; the next boundary, after that thread has run, does both shares. Dropping the share instead left
     // each sweep a boundary longer, and a 40 MiB heap ran full enough for alternate cycles to abort.
@@ -2806,6 +2818,19 @@ void GcIncremental_OnCompaction()
     if (s_sweeping)
     {
         FinishSweep("compaction");
+    }
+}
+
+void GcIncremental_OnNoGcRegionStart()
+{
+    if (s_cycleActive)
+    {
+        AbortCycle("no-GC region");
+    }
+
+    if (s_sweeping)
+    {
+        FinishSweep("no-GC region");
     }
 }
 

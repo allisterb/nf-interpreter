@@ -114,6 +114,9 @@ extern const CLR_RT_NativeAssemblyData g_CLR_AssemblyNative_System_IO_Ports;
 #if NANOCLR_USE_HOST_OS_SOCKETS
 extern const CLR_RT_NativeAssemblyData g_CLR_AssemblyNative_System_Net;
 #endif
+#if defined(NANOCLR_GC_NOGC_REGION)
+extern const CLR_RT_NativeAssemblyData g_CLR_AssemblyNative_QFlat_Device;
+#endif
 
 const CLR_RT_NativeAssemblyData *g_CLR_InteropAssembliesNativeData[] = {
     &g_CLR_AssemblyNative_mscorlib,
@@ -132,6 +135,9 @@ const CLR_RT_NativeAssemblyData *g_CLR_InteropAssembliesNativeData[] = {
     &g_CLR_AssemblyNative_System_IO_Ports,
 #if NANOCLR_USE_HOST_OS_SOCKETS
     &g_CLR_AssemblyNative_System_Net,
+#endif
+#if defined(NANOCLR_GC_NOGC_REGION)
+    &g_CLR_AssemblyNative_QFlat_Device,
 #endif
     nullptr,
 };
