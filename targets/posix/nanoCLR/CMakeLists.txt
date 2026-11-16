@@ -395,6 +395,10 @@ if(NANO_POSIX_ENABLE_SMOKE)
 add_executable(nanoFramework.nanoCLR.test main.cpp)
 target_compile_features(nanoFramework.nanoCLR.test PRIVATE cxx_std_20)
 target_link_libraries(nanoFramework.nanoCLR.test PRIVATE nanoFramework.nanoCLR)
+if(NANO_POSIX_GC_INCREMENTAL)
+    # --gc-profile is rejected without the incremental collector.
+    target_compile_definitions(nanoFramework.nanoCLR.test PRIVATE NANOCLR_GC_INCREMENTAL)
+endif()
 target_include_directories(
     nanoFramework.nanoCLR.test
     PRIVATE

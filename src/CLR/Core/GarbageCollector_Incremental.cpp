@@ -1164,6 +1164,51 @@ bool EnvFlag(const char *name)
     return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
 }
 
+// NANOCLR_GC_PROFILE presets. Each only supplies defaults: an explicitly set NANOCLR_GC_INCREMENTAL* variable wins.
+enum class GcProfile
+{
+    Unset,
+    Batch,       // stop-the-world on allocation failure (upstream behaviour)
+    Interactive, // incremental, 15% trigger: for apps with idle time to collect in
+    LowLatency,  // incremental, 1% trigger (25% unpaced): cycles start as soon as the last is swept
+    Unknown,
+};
+
+// Indexed by GcProfile. main.cpp's IsGcProfile (--gc-profile) repeats the three valid names.
+const char *const c_profileNames[] = {"unset", "batch", "interactive", "lowlatency", "unknown"};
+
+char AsciiLower(char c)
+{
+    return c >= 'A' && c <= 'Z' ? (char)(c + ('a' - 'A')) : c;
+}
+
+bool EqualsIgnoreCase(const char *a, const char *b)
+{
+    for (; *a != '\0' && AsciiLower(*a) == AsciiLower(*b); a++, b++)
+    {
+    }
+
+    return AsciiLower(*a) == AsciiLower(*b);
+}
+
+GcProfile ParseProfile(const char *value)
+{
+    if (value == nullptr || value[0] == '\0')
+    {
+        return GcProfile::Unset;
+    }
+
+    for (int p = (int)GcProfile::Batch; p <= (int)GcProfile::LowLatency; p++)
+    {
+        if (EqualsIgnoreCase(value, c_profileNames[p]))
+        {
+            return (GcProfile)p;
+        }
+    }
+
+    return GcProfile::Unknown;
+}
+
 // Calls f(obj, slot) for every object block in the heap walk.
 template <typename F> void ForEachObject(F f)
 {
@@ -2423,7 +2468,25 @@ void GcIncremental_OnHeapInitialized()
             (unsigned)s_verifyInject);
     }
 
-    s_incremental = EnvFlag("NANOCLR_GC_INCREMENTAL");
+    const char *profileName = getenv("NANOCLR_GC_PROFILE");
+    const char *incremental = getenv("NANOCLR_GC_INCREMENTAL");
+    GcProfile profile = ParseProfile(profileName);
+
+    if (profile == GcProfile::Unknown)
+    {
+        CLR_Debug::Printf(
+            "[GCC] unknown NANOCLR_GC_PROFILE '%s' (batch, interactive, lowlatency); treated as batch\r\n",
+            profileName);
+        profile = GcProfile::Batch;
+    }
+
+    s_incremental = incremental != nullptr ? EnvFlag("NANOCLR_GC_INCREMENTAL")
+                                           : profile == GcProfile::Interactive || profile == GcProfile::LowLatency;
+
+    if (!s_incremental && profile != GcProfile::Unset)
+    {
+        CLR_Debug::Printf("[GCC] profile=%s: stop-the-world\r\n", c_profileNames[(int)profile]);
+    }
 
     if (s_incremental)
     {
@@ -2435,7 +2498,9 @@ void GcIncremental_OnHeapInitialized()
         s_paceStepSlots = s_paceStepSlots > s_slots ? s_slots : s_paceStepSlots;
 
         // Paced cycles start almost as soon as the last one is swept, so each has most of the free memory to pace over.
-        const unsigned long defaultTrigger = s_pacePercent != 0 ? 1 : 25;
+        // Idle work finishes cycles early, so at 1% they run back to back in idle time; Interactive trades some
+        // allocation-paced work for far less idle CPU.
+        const unsigned long defaultTrigger = profile == GcProfile::Interactive ? 15 : (s_pacePercent != 0 ? 1 : 25);
         const char *trigger = getenv("NANOCLR_GC_INCREMENTAL_TRIGGER");
         const char *slice = getenv("NANOCLR_GC_INCREMENTAL_SLICE");
         unsigned long percent = trigger ? strtoul(trigger, nullptr, 10) : defaultTrigger;
@@ -2475,9 +2540,10 @@ void GcIncremental_OnHeapInitialized()
                                                               : s_sweepCatchupNs + 100000;
 
         CLR_Debug::Printf(
-            "[GCC] incremental on: trigger=%u slots slice=%u slots stress_every=%u allocations sweep=%s stats=%u "
-            "fallback_every=%u clusters sweep_us=%u catchup_us=%u pace=%u%% pace_step=%u slots defer=%u idle=%u "
-            "idle_guard_us=%u\r\n",
+            "[GCC] incremental on: profile=%s trigger=%u slots slice=%u slots stress_every=%u allocations sweep=%s "
+            "stats=%u fallback_every=%u clusters sweep_us=%u catchup_us=%u pace=%u%% pace_step=%u slots defer=%u "
+            "idle=%u idle_guard_us=%u\r\n",
+            c_profileNames[(int)profile],
             (unsigned)s_triggerSlots,
             (unsigned)s_sliceSlots,
             (unsigned)s_stressEvery,

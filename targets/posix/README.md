@@ -273,13 +273,37 @@ IPv4 addresses exposed by the managed snapshot.
   - keep-alive shading where weak pointers are read;
   - object-start, event-start, block-end, allocated-this-cycle and marked bitmaps in host memory,
     one bit per heap block each;
-  - an incremental mark cycle, which is off unless `NANOCLR_GC_INCREMENTAL=1` is set;
+  - an incremental mark cycle, which is off unless `NANOCLR_GC_INCREMENTAL=1` is set or a profile
+    turns it on (below);
   - free-memory accounting during the sweep. Every collection takes its free-byte count from the
     free runs the sweep rebuilds the free lists from, instead of walking every free-list node
     afterwards. Barrier stress and verify modes also do the walk and print
     `[GCI] free count mismatch ...` if the two differ.
 
   When `OFF`, every hook compiles to nothing.
+- **Profiles:** `NANOCLR_GC_PROFILE`, or the runner's `--gc-profile NAME` (which overrides it), picks a
+  preset. Names are case-insensitive; an unknown name prints a warning and is treated as `batch`.
+
+  | Profile | Collector | Default trigger | For |
+  |---|---|---|---|
+  | unset | stop-the-world unless `NANOCLR_GC_INCREMENTAL=1` | 1% paced, 25% unpaced | earlier behaviour |
+  | `batch` | stop-the-world on allocation failure | – | throughput |
+  | `interactive` | incremental | 15% | apps with idle time: fewer cycles, less idle CPU |
+  | `lowlatency` | incremental | 1% paced, 25% unpaced | allocation-bound loops with little idle time |
+
+  A profile only supplies defaults. Any `NANOCLR_GC_INCREMENTAL*` variable that is set wins; a set
+  `NANOCLR_GC_INCREMENTAL` decides the collector even when empty or `0`. A trigger of 0 or a
+  non-number still means "the default", which is the profile's. The startup line reports
+  `profile=...` (`unset` without one), and `[GCC] profile=NAME: stop-the-world` is printed when a
+  profile is set and the collector is stop-the-world. `--gc-profile` is rejected by a build without
+  `NANO_POSIX_GC_INCREMENTAL`.
+
+  On QEMU with a 40 MiB heap, `batch` paused about 24 ms per collection (sleeper p99 17–21 ms),
+  where both incremental profiles kept sleeper p99 under 0.2 ms. With the probe idle about half the
+  time, `interactive` ran 167 cycles and spent 2.5 s of 32 s on idle work, while `lowlatency` ran 620
+  and 9.5 s, for 9% more throughput. With no idle time, `interactive` matched `lowlatency` at 40 MiB.
+  At 400 MiB, one of its two runs fell behind: 21 cycles aborted, and a forced stop-the-world
+  collection took 281 ms. `lowlatency` aborted none, so keep it for allocation-bound programs.
 - `NANOCLR_GC_INCREMENTAL=1` turns on incremental cycles.
   - **Start:** once `NANOCLR_GC_INCREMENTAL_TRIGGER` percent of the heap (1–100; default 1 with
     allocation pacing, 25 without) has been allocated since the last collection, the initial pause
@@ -393,6 +417,7 @@ IPv4 addresses exposed by the managed snapshot.
       the same run, it gave 6.5% more throughput than 15% with idle work off, and 23 rather than
       32 MB in use. One of its 600 samples was 4.3 ms late, with no GC step over 0.54 ms in that
       run, most likely the VM. A workload with no idle time still needs the low trigger to pace.
+      The `interactive` profile uses 15%, `lowlatency` 1%.
     - `[GCC]` lines count the cycle's idle shares in `idle`, and their time in `idle_us`.
   - **Requested collections:** a collection requested mid-cycle, for example on allocation failure
     or `GC.Collect`, discards the cycle and marks stop-the-world. This gives the exact result: the

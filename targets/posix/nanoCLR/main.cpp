@@ -7,7 +7,10 @@
 // Calls through the public exported API — no direct CLR symbols.
 //
 // Usage:
-//   nanoFramework.nanoCLR.test [--ca-bundle path] [--assemblies] file1.pe [file2.pe ...]
+//   nanoFramework.nanoCLR.test [--ca-bundle path] [--gc-profile batch|interactive|lowlatency] [--assemblies]
+//                              file1.pe [file2.pe ...]
+//
+// --gc-profile sets NANOCLR_GC_PROFILE and needs a NANO_POSIX_GC_INCREMENTAL=ON build.
 //
 // All positional arguments (and arguments after --assemblies) that end in
 // .pe are treated as managed assembly files to load before running the CLR.
@@ -15,6 +18,7 @@
 // Assemblies must be provided in dependency order (mscorlib.pe first).
 
 #include <cstring>
+#include <strings.h>
 #include <cerrno>
 #include <cstdlib>
 #include <fstream>
@@ -69,6 +73,19 @@ std::u16string ToChar16(const char *s)
     return std::u16string(s, s + std::strlen(s));
 }
 
+#if defined(NANOCLR_GC_INCREMENTAL)
+// The NANOCLR_GC_PROFILE names (c_profileNames in GarbageCollector_Incremental.cpp), case-insensitive as there.
+bool IsGcProfile(const char *s)
+{
+    for (const char *name : {"batch", "interactive", "lowlatency"})
+    {
+        if (strcasecmp(s, name) == 0)
+            return true;
+    }
+    return false;
+}
+#endif
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -80,6 +97,7 @@ int main(int argc, char **argv)
     // The --assemblies flag is accepted but not required (mirrors nanoclr CLI).
     std::vector<std::string> peFiles;
     const char *caBundlePath = nullptr;
+    const char *gcProfile = nullptr;
 
     for (int i = 1; i < argc; i++)
     {
@@ -99,6 +117,21 @@ int main(int argc, char **argv)
             return 1;
 #endif
         }
+        if (std::strcmp(argv[i], "--gc-profile") == 0)
+        {
+#if defined(NANOCLR_GC_INCREMENTAL)
+            if (gcProfile != nullptr || i + 1 >= argc || !IsGcProfile(argv[i + 1]))
+            {
+                std::cerr << "error: --gc-profile requires one of batch, interactive or lowlatency, once\n";
+                return 1;
+            }
+            gcProfile = argv[++i];
+            continue;
+#else
+            std::cerr << "error: --gc-profile requires a build with NANO_POSIX_GC_INCREMENTAL=ON\n";
+            return 1;
+#endif
+        }
         if (std::strcmp(argv[i], "--assemblies") == 0)
             continue; // skip the flag itself
 
@@ -115,6 +148,13 @@ int main(int argc, char **argv)
     if (caBundlePath != nullptr && setenv("NANOCLR_CA_BUNDLE", caBundlePath, 1) != 0)
     {
         std::cerr << "error: cannot configure CA bundle: " << std::strerror(errno) << "\n";
+        return 1;
+    }
+
+    // Read by the incremental GC build at startup; overrides NANOCLR_GC_PROFILE.
+    if (gcProfile != nullptr && setenv("NANOCLR_GC_PROFILE", gcProfile, 1) != 0)
+    {
+        std::cerr << "error: cannot set the GC profile: " << std::strerror(errno) << "\n";
         return 1;
     }
 
