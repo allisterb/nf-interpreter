@@ -371,6 +371,29 @@ IPv4 addresses exposed by the managed snapshot.
     each sweep then took a boundary longer, and a 40 MiB heap ran full enough for alternate cycles to
     abort. `[GCC]` lines count the deferred boundaries in `deferred`; `sweep_steps`, `slices` and
     their `*_max_us` count shares, so a boundary that does both can take twice `step_max_us`.
+    Idle work (below) that does cycle work stands in for a deferred share.
+  - **Idle work** (`NANOCLR_GC_INCREMENTAL_IDLE`, default on; `0` turns it off). When no thread is
+    ready, the scheduler runs boundary shares (sweep steps, cycle starts, mark slices, the final
+    pause, the `[GCC]` print) before it sleeps. It stops once the next timer or wait deadline is
+    within `NANOCLR_GC_INCREMENTAL_IDLE_GUARD_US` (default: the catch-up sweep budget plus 100 µs,
+    so 500 µs), after 1 ms, or when a thread becomes ready, then rechecks timers and threads. A
+    share can still overrun the guard: a mark slice is bounded by slots, not time (1.1–1.6 ms at
+    most on QEMU, with idle work on or off), a sweep step finishes its cluster, and a grey-stack
+    overflow collects stop-the-world.
+    - On QEMU, with the probe's Hammer sleeping 5 ms after every 3,000 operations (about half the
+      CPU idle), the paced collector's mark steps in the allocator fell from about 850 to 62 per
+      cycle at 40 MiB and from 8,340 to 42 at 400 MiB. The sweep span fell from 46 to 1 ms and
+      from 450 to 28 ms. Throughput rose 2% and 5%, heap in use fell from 28 to 23 MB and from 281
+      to 233 MB. Sleeper lateness was a 41–44 µs median (44–51 off) and about 0.17 ms p99.
+    - Cycles finish sooner, so with the 1% trigger they run back to back: 3.8× as many at 40 MiB,
+      with about 30% of the run's time spent on idle GC work. That time is idle for nanoCLR but
+      not necessarily for QNX: lower-priority processes lose it. A higher
+      `NANOCLR_GC_INCREMENTAL_TRIGGER` keeps the gains for less work. At 40 MiB, 15% with idle work
+      gave about as many cycles as idle work off at 1%, with 8% of the time spent on idle work. In
+      the same run, it gave 6.5% more throughput than 15% with idle work off, and 23 rather than
+      32 MB in use. One of its 600 samples was 4.3 ms late, with no GC step over 0.54 ms in that
+      run, most likely the VM. A workload with no idle time still needs the low trigger to pace.
+    - `[GCC]` lines count the cycle's idle shares in `idle`, and their time in `idle_us`.
   - **Requested collections:** a collection requested mid-cycle, for example on allocation failure
     or `GC.Collect`, discards the cycle and marks stop-the-world. This gives the exact result: the
     cycle's snapshot would keep everything reachable at its start or allocated since. Such a cycle
@@ -378,8 +401,8 @@ IPv4 addresses exposed by the managed snapshot.
     late or the slices are too small.
   - **GC-stress mode:** `NANOCLR_GC_INCREMENTAL_STRESS=N` also starts a cycle or runs one slice
     every N object allocations, from inside the allocator. This interleaves marking with native
-    code as well as with IL. The final pause still waits for the next quantum boundary. Combine it
-    with `NANOCLR_GC_VERIFY=1`.
+    code as well as with IL. The final pause still waits for the next quantum boundary or idle
+    work. Combine it with `NANOCLR_GC_VERIFY=1`.
     - The `[GCC]` line's `slices` and `slice_max_us` include slices run from the allocator.
     - A miss reported in this mode is not necessarily a barrier hole. It can also be an upstream
       native that holds an object only in a C++ local across an allocation, which
@@ -392,14 +415,14 @@ IPv4 addresses exposed by the managed snapshot.
     next quantum boundary rather than in the final pause, because a write to stdout is a message to
     the filesystem manager on QNX and cost about 60 µs of every pause. The running thread still pays
     that cost at the quantum boundary, so leave stats off where latency matters.
-    - The line waits while every thread is blocked, and is lost if the program ends before another
-      quantum. A soft reboot prints it first.
+    - With idle work off, the line waits while every thread is blocked. It is lost if the program
+      ends before another quantum or idle work. A soft reboot prints it first.
     - The startup line `[GCC] incremental on: ...` shows `stats=1`.
     - `[GCC] cycle=N aborted: ...` lines print whatever the setting, inside the collection that
       aborts the cycle. That collection is a stop-the-world one, which costs far more than the print.
 
     ```text
-    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=... fallback_clusters=... sweep_steps=... step_max_us=... sweep_span_ms=... swept_on_alloc=... catchup_steps=... trigger_wait_us=... forced=none forced_clusters=0 forced_us=0 used_bytes=... deferred=...
+    [GCC] cycle=3 run=7 slices=2 initial_us=4 slice_max_us=... final_mark_us=... live_us=... sweep_us=... bitmap_sweep=1 total_ms=... roots=... scanned=... slots=... final_scanned=... allocated_black=... grey_max=... pre_us=... heap_us=... clear_us=... mask_us=... apply_us=... post_us=... free_runs=... dead_objects=... fallback_clusters=... sweep_steps=... step_max_us=... sweep_span_ms=... swept_on_alloc=... catchup_steps=... trigger_wait_us=... forced=none forced_clusters=0 forced_us=0 used_bytes=... deferred=... idle=... idle_us=...
     ```
 
     - `final_mark_us` is the final pause's marking: draining what is still grey, the finalizer
@@ -433,7 +456,9 @@ IPv4 addresses exposed by the managed snapshot.
       in the pause (the `[GCT]` line is exact then).
     - `deferred` counts the boundaries, from the cycle's start to the end of its sweep, whose work
       was deferred to the next boundary because a deadline ended the quantum.
-    - The line is kept when the sweep ends and printed at the next quantum boundary.
+    - `idle` counts the boundary shares the cycle ran while no thread was ready, and `idle_us` their
+      time, less a share that ended the sweep or started the cycle.
+    - The line is kept when the sweep ends and printed at the next quantum boundary or idle work.
     - `total_ms` runs from the initial pause to the end of the sweep, wherever it ends.
     - Free memory (`m_freeBytes`) stays at the previous collection's value until the sweep ends,
       then counts every cluster's free runs less what was allocated from swept clusters since.

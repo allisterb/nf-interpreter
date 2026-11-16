@@ -111,6 +111,11 @@ bool GcIncremental_FinishCycle();
 // moves to the next boundary, which does both shares (unless the previous boundary's moved too, or
 // NANOCLR_GC_INCREMENTAL_DEFER=0).
 void GcIncremental_OnQuantum(bool deadline);
+// No thread is ready and the next deadline is timeout (HAL ticks) away: start quantum-boundary shares until it is
+// within NANOCLR_GC_INCREMENTAL_IDLE_GUARD_US, for 1 ms, or until a thread is ready. Returns true if any ran (the
+// caller then rechecks timers and threads before waiting); false with no work, the deadline within the guard, or
+// NANOCLR_GC_INCREMENTAL_IDLE=0.
+bool GcIncremental_OnIdle(CLR_INT64 timeout);
 // Heap compaction is about to move objects: abort any active cycle, and finish any sweep.
 void GcIncremental_OnCompaction();
 
@@ -156,6 +161,7 @@ void GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_SWEEP_HEAP()         if (!GcIncremental_OnSweepHeap())
 #define NANOCLR_GC_ON_SWEPT()              GcIncremental_OnSwept();
 #define NANOCLR_GC_ON_QUANTUM(deadline)    GcIncremental_OnQuantum(deadline);
+#define NANOCLR_GC_ON_IDLE(timeout)        GcIncremental_OnIdle(timeout)
 #define NANOCLR_GC_ON_COMPACTION()         GcIncremental_OnCompaction();
 #define NANOCLR_GC_MARK()                                                                                              \
     {                                                                                                                  \
@@ -198,6 +204,7 @@ void GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_SWEEP_HEAP()
 #define NANOCLR_GC_ON_SWEPT()
 #define NANOCLR_GC_ON_QUANTUM(deadline) (void)(deadline);
+#define NANOCLR_GC_ON_IDLE(timeout)     ((void)(timeout), false)
 #define NANOCLR_GC_ON_COMPACTION()
 #define NANOCLR_GC_MARK()                        Mark();
 #define NANOCLR_GC_COMPUTE_ALIVE_VS_DEAD_RATIO() Heap_ComputeAliveVsDeadRatio();

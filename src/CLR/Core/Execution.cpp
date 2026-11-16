@@ -1812,6 +1812,12 @@ CLR_UINT32 CLR_RT_ExecutionEngine::WaitForActivity()
         }
         NANOCLR_FOREACH_NODE_END();
 
+        // Incremental GC work fills idle time up to near the next deadline; the run loop then comes back here.
+        if (CLR_EE_DBG_IS_NOT(Stopped) && NANOCLR_GC_ON_IDLE(timeoutMin))
+        {
+            return 0;
+        }
+
         return WaitForActivity(SLEEP_LEVEL__SLEEP, g_CLR_HW_Hardware.m_wakeupEvents, timeoutMin);
     }
 

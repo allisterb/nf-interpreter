@@ -113,6 +113,7 @@ struct GcIncrementalCycle
     uint64_t clearNs;
     uint64_t stepMaxNs;          // longest sweep step after the pause (at a quantum boundary, or a failed allocation's)
     uint64_t forcedNs;           // forced finishes, summed
+    uint64_t idleNs;             // shares run while no thread was ready, summed
     uint64_t triggerNs;          // the next cycle's trigger fired while this sweep ran (0 if it did not)
     const char *forced;          // what last forced several clusters to be swept at once, or null
     CLR_UINT32 run;              // the final pause's collection number
@@ -123,6 +124,7 @@ struct GcIncrementalCycle
     CLR_UINT32 sweepSteps;       // sweep steps at quantum boundaries
     CLR_UINT32 catchupSteps;     // of those, steps at the catch-up budget, the next cycle's trigger having fired
     CLR_UINT32 deferred;         // boundaries ended by a deadline, whose work the next boundary did
+    CLR_UINT32 idleShares;       // boundary shares run while no thread was ready
     CLR_UINT32 sweptOnAlloc;     // failed allocations that swept as a step (not as a forced finish)
     CLR_UINT32 forcedClusters;   // clusters swept by forced finishes
     CLR_UINT32 slices;
@@ -256,6 +258,8 @@ uint64_t s_sweepBudgetNs;  // NANOCLR_GC_INCREMENTAL_SWEEP_US per quantum bounda
 uint64_t s_sweepCatchupNs; // NANOCLR_GC_INCREMENTAL_SWEEP_CATCHUP_US: the budget once the next cycle's trigger fired
 bool s_deferOnDeadline;    // NANOCLR_GC_INCREMENTAL_DEFER (default 1): defer the work of a boundary a deadline ended
 bool s_deferredLast;       // the previous boundary's work was deferred to this one
+bool s_idleWork;           // NANOCLR_GC_INCREMENTAL_IDLE (default 1): run boundary shares while no thread is ready
+uint64_t s_idleGuardNs;    // NANOCLR_GC_INCREMENTAL_IDLE_GUARD_US: stop idle work this far before the next deadline
 GcIncrementalShadowTotals s_shadow;
 
 uint64_t NowNs()
@@ -969,7 +973,7 @@ void PrintReport(const GcIncrementalReport &r)
     CLR_Debug::Printf(
         "pre_us=%u heap_us=%u clear_us=%u mask_us=%u apply_us=%u post_us=%u free_runs=%u dead_objects=%u "
         "fallback_clusters=%u sweep_steps=%u step_max_us=%u sweep_span_ms=%u swept_on_alloc=%u catchup_steps=%u "
-        "trigger_wait_us=%u forced=%s forced_clusters=%u forced_us=%u used_bytes=%u deferred=%u\r\n",
+        "trigger_wait_us=%u forced=%s forced_clusters=%u forced_us=%u used_bytes=%u deferred=%u idle=%u idle_us=%u\r\n",
         us(c.markedEndNs, c.heapNs),
         us(c.heapNs, c.sweptNs),
         phases ? (unsigned)(c.clearNs / 1000) : 0u,
@@ -989,7 +993,9 @@ void PrintReport(const GcIncrementalReport &r)
         (unsigned)c.forcedClusters,
         (unsigned)(c.forcedNs / 1000),
         (unsigned)c.usedBytes,
-        (unsigned)c.deferred);
+        (unsigned)c.deferred,
+        (unsigned)c.idleShares,
+        (unsigned)(c.idleNs / 1000));
 }
 
 // GC-stress mode (NANOCLR_GC_INCREMENTAL_STRESS=N), every N object allocations, from inside the allocator: start a
@@ -2302,6 +2308,7 @@ void GcIncremental_OnHeapInitialized()
     s_reportPending = false;
     s_deferOnDeadline = false;
     s_deferredLast = false;
+    s_idleWork = false;
 
     if (s_starts)
     {
@@ -2458,9 +2465,19 @@ void GcIncremental_OnHeapInitialized()
         const char *defer = getenv("NANOCLR_GC_INCREMENTAL_DEFER");
         s_deferOnDeadline = defer == nullptr || strcmp(defer, "0") != 0;
 
+        // A margin for one share, by default the catch-up sweep budget plus 100 us. A share can still overrun it: a
+        // mark slice is bounded by slots, not time, a sweep step finishes its cluster, and a grey-stack overflow
+        // collects stop-the-world.
+        const char *idle = getenv("NANOCLR_GC_INCREMENTAL_IDLE");
+        const char *idleGuardUs = getenv("NANOCLR_GC_INCREMENTAL_IDLE_GUARD_US");
+        s_idleWork = idle == nullptr || strcmp(idle, "0") != 0;
+        s_idleGuardNs = idleGuardUs && idleGuardUs[0] != '\0' ? strtoul(idleGuardUs, nullptr, 10) * (uint64_t)1000
+                                                              : s_sweepCatchupNs + 100000;
+
         CLR_Debug::Printf(
             "[GCC] incremental on: trigger=%u slots slice=%u slots stress_every=%u allocations sweep=%s stats=%u "
-            "fallback_every=%u clusters sweep_us=%u catchup_us=%u pace=%u%% pace_step=%u slots defer=%u\r\n",
+            "fallback_every=%u clusters sweep_us=%u catchup_us=%u pace=%u%% pace_step=%u slots defer=%u idle=%u "
+            "idle_guard_us=%u\r\n",
             (unsigned)s_triggerSlots,
             (unsigned)s_sliceSlots,
             (unsigned)s_stressEvery,
@@ -2471,7 +2488,9 @@ void GcIncremental_OnHeapInitialized()
             (unsigned)(s_sweepCatchupNs / 1000),
             (unsigned)s_pacePercent,
             (unsigned)s_paceStepSlots,
-            (unsigned)s_deferOnDeadline);
+            (unsigned)s_deferOnDeadline,
+            (unsigned)s_idleWork,
+            (unsigned)(s_idleGuardNs / 1000));
     }
 }
 
@@ -2625,14 +2644,20 @@ static void QuantumWork()
     }
 }
 
+// QuantumWork() would do something.
+static bool QuantumWorkDue()
+{
+    return s_valid && s_incremental &&
+           (s_reportPending || s_cycleActive || s_sweeping ||
+            (s_allocatedSinceGc >= s_triggerSlots && !CLR_EE_IS(Compaction_Pending)));
+}
+
 void GcIncremental_OnQuantum(bool deadline)
 {
     // ProcessTimer runs after this, so work here delays the thread whose deadline ended the quantum. Skip it, never
     // twice in a row; the next boundary, after that thread has run, does both shares. Dropping the share instead left
     // each sweep a boundary longer, and a 40 MiB heap ran full enough for alternate cycles to abort.
-    const bool work = s_reportPending || s_cycleActive || s_sweeping || s_allocatedSinceGc >= s_triggerSlots;
-
-    if (deadline && work && s_deferOnDeadline && !s_deferredLast)
+    if (deadline && QuantumWorkDue() && s_deferOnDeadline && !s_deferredLast)
     {
         s_deferredLast = true;
         if (s_cycleActive || s_sweeping)
@@ -2651,6 +2676,58 @@ void GcIncremental_OnQuantum(bool deadline)
     {
         QuantumWork();
     }
+}
+
+bool GcIncremental_OnIdle(CLR_INT64 timeout)
+{
+    // Short chunks, so ProcessTimer and the hardware events between them are not held off for long.
+    constexpr uint64_t c_idleChunkNs = 1000000;
+
+    if (!s_idleWork || timeout <= 0)
+    {
+        return false;
+    }
+
+    const uint64_t left = (uint64_t)timeout * 100; // HAL ticks are 100 ns
+    if (left <= s_idleGuardNs)
+    {
+        return false;
+    }
+
+    const uint64_t start = NowNs();
+    const uint64_t budget = left - s_idleGuardNs < c_idleChunkNs ? left - s_idleGuardNs : c_idleChunkNs;
+    uint64_t now = start;
+    bool ran = false;
+    bool cycleWork = false;
+
+    // A final pause can make the finalizer thread ready: it runs before any further share.
+    while (QuantumWorkDue() && now - start < budget && g_CLR_RT_ExecutionEngine.m_threadsReady.IsEmpty())
+    {
+        // Counted before QuantumWork, which may end the cycle's sweep and queue its report. The time is added only if
+        // the same cycle is still running, so idle_us leaves out a share that ended the sweep or started a cycle.
+        const uint64_t cycleStart = s_cycle.startNs;
+        if (s_cycleActive || s_sweeping)
+        {
+            s_cycle.idleShares++;
+            cycleWork = true;
+        }
+
+        QuantumWork();
+        const uint64_t end = NowNs();
+
+        if ((s_cycleActive || s_sweeping) && s_cycle.startNs == cycleStart)
+        {
+            s_cycle.idleNs += end - now;
+        }
+
+        now = end;
+        ran = true;
+    }
+
+    // Cycle work here stands in for a deferred boundary share.
+    s_deferredLast = s_deferredLast && !cycleWork;
+
+    return ran;
 }
 
 void GcIncremental_OnCompaction()
