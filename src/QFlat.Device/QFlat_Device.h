@@ -13,12 +13,53 @@
 #include <nanoCLR_Runtime.h>
 #include <nanoPackStruct.h>
 
+typedef enum __nfpack GcProfile
+{
+    GcProfile_Batch = 0,
+    GcProfile_Interactive = 1,
+    GcProfile_LowLatency = 2,
+} GcProfile;
+
 struct Library_QFlat_Device_QFlat_Device_GcPolicy
 {
     NANOCLR_NATIVE_DECLARE(get_InNoGcRegion___STATIC__BOOLEAN);
     NANOCLR_NATIVE_DECLARE(get_GcWorkCount___STATIC__I8);
+    NANOCLR_NATIVE_DECLARE(ResetPauseStats___STATIC__VOID);
     NANOCLR_NATIVE_DECLARE(EndNoGcRegion___STATIC__BOOLEAN);
     NANOCLR_NATIVE_DECLARE(NativeStartNoGcRegion___STATIC__BOOLEAN__I4);
+    NANOCLR_NATIVE_DECLARE(NativeGetProfile___STATIC__I4);
+    NANOCLR_NATIVE_DECLARE(NativeSetProfile___STATIC__VOID__I4);
+    NANOCLR_NATIVE_DECLARE(NativeGetStats___STATIC__VOID__SZARRAY_I8);
+
+    //--//
+};
+
+struct Library_QFlat_Device_QFlat_Device_GcStats
+{
+    // renamed backing field '<Collections>k__BackingField'
+    static const int FIELD__Collections = 1;
+    // renamed backing field '<Compactions>k__BackingField'
+    static const int FIELD__Compactions = 2;
+    // renamed backing field '<IncrementalSteps>k__BackingField'
+    static const int FIELD__IncrementalSteps = 3;
+    // renamed backing field '<CyclesCompleted>k__BackingField'
+    static const int FIELD__CyclesCompleted = 4;
+    // renamed backing field '<CyclesAborted>k__BackingField'
+    static const int FIELD__CyclesAborted = 5;
+    // renamed backing field '<WorkUnits>k__BackingField'
+    static const int FIELD__WorkUnits = 6;
+    // renamed backing field '<LastPauseMicroseconds>k__BackingField'
+    static const int FIELD__LastPauseMicroseconds = 7;
+    // renamed backing field '<MaxPauseMicroseconds>k__BackingField'
+    static const int FIELD__MaxPauseMicroseconds = 8;
+    // renamed backing field '<TotalPauseMicroseconds>k__BackingField'
+    static const int FIELD__TotalPauseMicroseconds = 9;
+    // renamed backing field '<HeapBytes>k__BackingField'
+    static const int FIELD__HeapBytes = 10;
+    // renamed backing field '<FreeBytes>k__BackingField'
+    static const int FIELD__FreeBytes = 11;
+    // renamed backing field '<AllocatedBytes>k__BackingField'
+    static const int FIELD__AllocatedBytes = 12;
 
     //--//
 };

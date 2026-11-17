@@ -268,8 +268,20 @@ IPv4 addresses exposed by the managed snapshot.
 
 `NANO_POSIX_GC_NOGC_REGION`
 - Default: `ON`
-- No-GC regions, and the native side of the QFlat.Device assembly (qflat `src/QFlat.Device`) that exposes them:
-  `GcPolicy.TryStartNoGcRegion(bytes)`, `EndNoGcRegion()`, `InNoGcRegion` and `GcWorkCount`.
+- No-GC regions, GC statistics and the run-time profile. Also the native side of the QFlat.Device assembly (qflat
+  `src/QFlat.Device`), which exposes them as `GcPolicy`:
+  - `TryStartNoGcRegion(bytes)`, `EndNoGcRegion()` and `InNoGcRegion`;
+  - `GetStats()`, `ResetPauseStats()` and `GcWorkCount`;
+  - `Profile`, which can be read and set.
+- **Statistics:**
+  - Every collection, compaction and incremental step is counted.
+  - A pause is the time a thread waits for the GC work at one point (a quantum boundary, an idle share, an
+    allocation, or a collection), timed with `CLOCK_MONOTONIC`.
+  - Allocation is counted where the allocator hands out blocks.
+- **Profile switching:** setting `Profile` at run time applies a preset. `Batch` stops any incremental cycle. The
+  incremental profiles set their trigger; the other `NANOCLR_GC_INCREMENTAL_*` values keep their startup values,
+  which are now parsed even when the collector starts stop-the-world. A build without
+  `NANO_POSIX_GC_INCREMENTAL` accepts only `Batch`.
 - **What a region stops:** while a region is active, no GC work of any kind runs on any managed thread. That covers:
   - stop-the-world collection;
   - incremental cycle starts, slices, pace steps, sweep steps and final pauses;

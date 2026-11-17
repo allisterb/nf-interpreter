@@ -13,7 +13,11 @@
 static const CLR_RT_MethodHandler method_lookup[] =
 {
     Library_QFlat_Device_QFlat_Device_GcPolicy::EndNoGcRegion___STATIC__BOOLEAN,
+    Library_QFlat_Device_QFlat_Device_GcPolicy::NativeGetProfile___STATIC__I4,
+    Library_QFlat_Device_QFlat_Device_GcPolicy::NativeGetStats___STATIC__VOID__SZARRAY_I8,
+    Library_QFlat_Device_QFlat_Device_GcPolicy::NativeSetProfile___STATIC__VOID__I4,
     Library_QFlat_Device_QFlat_Device_GcPolicy::NativeStartNoGcRegion___STATIC__BOOLEAN__I4,
+    Library_QFlat_Device_QFlat_Device_GcPolicy::ResetPauseStats___STATIC__VOID,
     Library_QFlat_Device_QFlat_Device_GcPolicy::get_GcWorkCount___STATIC__I8,
     Library_QFlat_Device_QFlat_Device_GcPolicy::get_InNoGcRegion___STATIC__BOOLEAN,
 };
@@ -21,7 +25,7 @@ static const CLR_RT_MethodHandler method_lookup[] =
 const CLR_RT_NativeAssemblyData g_CLR_AssemblyNative_QFlat_Device =
 {
     "QFlat.Device",
-    0x2A4F48B5,
+    0x32B1F8AA,
     method_lookup,
     ARRAYSIZE(method_lookup)
 };

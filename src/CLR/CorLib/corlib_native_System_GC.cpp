@@ -81,6 +81,8 @@ HRESULT Library_corlib_native_System_GC::Run___STATIC__U4__BOOLEAN(CLR_RT_StackF
     }
 #endif
 
+    // The collection and the compaction delay the caller together: one pause.
+    NANOCLR_GC_STATS_PAUSE()
     stack.SetResult_I4(g_CLR_RT_ExecutionEngine.PerformGarbageCollection());
 
     if (stack.Arg0().NumericByRefConst().u1)

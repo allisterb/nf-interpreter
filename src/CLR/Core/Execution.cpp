@@ -399,7 +399,7 @@ CLR_UINT32 CLR_RT_ExecutionEngine::PerformGarbageCollection()
     NATIVE_PROFILE_CLR_CORE();
     // A collection requested inside a no-GC region (GC.Collect, GC.GetTotalMemory) ends the region.
     NANOCLR_GC_NOGC_ON_COLLECT()
-    NANOCLR_GC_COUNT_WORK()
+    NANOCLR_GC_STATS_SCOPE(Collection)
     m_heapState = c_HeapState_UnderGC;
 
     CLR_UINT32 freeMem = g_CLR_RT_GarbageCollector.ExecuteGarbageCollection();
@@ -434,7 +434,7 @@ void CLR_RT_ExecutionEngine::PerformHeapCompaction()
         return;
     }
 
-    NANOCLR_GC_COUNT_WORK()
+    NANOCLR_GC_STATS_SCOPE(Compaction)
     g_CLR_RT_GarbageCollector.ExecuteCompaction();
 
     CLR_EE_CLR(Compaction_Pending);
@@ -2164,6 +2164,9 @@ CLR_RT_HeapBlock *CLR_RT_ExecutionEngine::ExtractHeapBlocks(
 
     // Inside a no-GC region a failed allocation returns null rather than collect.
     NANOCLR_GC_NOGC_NO_COLLECT(flags)
+
+    // A failed attempt's forced sweep and collection delay this allocation together: one pause.
+    NANOCLR_GC_STATS_PAUSE()
 
     for (int phase = 0;; phase++)
     {

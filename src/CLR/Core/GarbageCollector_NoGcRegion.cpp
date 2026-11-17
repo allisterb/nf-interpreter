@@ -19,13 +19,18 @@ bool g_GcNoGcRegion_Active = false;
 namespace
 {
 
-bool s_broken;           // a collection ended the region before EndNoGcRegion
-bool s_traced;           // NANOCLR_GC_NOGC_TRACE read
-bool s_trace;            // print a [GCN] line at each start and end
-uint64_t s_budgetBlocks; // the region's declared budget
-uint64_t s_usedBlocks;   // blocks requested inside the region
-uint64_t s_workAtStart;  // GcNoGcRegion_WorkCount() when the region started
-uint64_t s_workCount;    // full collections, compactions and incremental cycle steps
+bool s_broken;               // a collection ended the region before EndNoGcRegion
+bool s_traced;               // NANOCLR_GC_NOGC_TRACE read
+bool s_trace;                // print a [GCN] line at each start and end
+uint64_t s_budgetBlocks;     // the region's declared budget
+uint64_t s_allocatedAtStart; // GcStats_AllocatedBlocks() when the region started
+uint64_t s_workAtStart;      // GcStats_WorkUnits() when the region started
+
+// Blocks the allocator handed out since the region started (event-cache hits and failed attempts are not counted).
+uint64_t UsedBlocks()
+{
+    return GcStats_AllocatedBlocks() - s_allocatedAtStart;
+}
 
 bool Trace()
 {
@@ -76,8 +81,8 @@ HRESULT GcNoGcRegion_Start(CLR_INT64 bytes, bool &started)
     }
 
     s_budgetBlocks = ((CLR_UINT64)bytes + sizeof(CLR_RT_HeapBlock) - 1) / sizeof(CLR_RT_HeapBlock);
-    s_usedBlocks = 0;
-    s_workAtStart = s_workCount;
+    s_allocatedAtStart = GcStats_AllocatedBlocks();
+    s_workAtStart = GcStats_WorkUnits();
     g_GcNoGcRegion_Active = true;
     started = true;
 
@@ -101,7 +106,7 @@ bool GcNoGcRegion_End()
         return false;
     }
 
-    const bool held = g_GcNoGcRegion_Active && s_usedBlocks <= s_budgetBlocks;
+    const bool held = g_GcNoGcRegion_Active && UsedBlocks() <= s_budgetBlocks;
 
     if (Trace())
     {
@@ -109,9 +114,9 @@ bool GcNoGcRegion_End()
             "[GCN] end held=%u broken=%u used_bytes=%llu budget_bytes=%llu gc_work=%llu\r\n",
             (unsigned)held,
             (unsigned)s_broken,
-            (unsigned long long)(s_usedBlocks * sizeof(CLR_RT_HeapBlock)),
+            (unsigned long long)(UsedBlocks() * sizeof(CLR_RT_HeapBlock)),
             (unsigned long long)(s_budgetBlocks * sizeof(CLR_RT_HeapBlock)),
-            (unsigned long long)(s_workCount - s_workAtStart));
+            (unsigned long long)(GcStats_WorkUnits() - s_workAtStart));
     }
 
     // Pending compaction runs at the next safe point, and the incremental collector's trigger, which kept counting,
@@ -127,21 +132,6 @@ bool GcNoGcRegion_InRegion()
     return g_GcNoGcRegion_Active || s_broken;
 }
 
-uint64_t GcNoGcRegion_WorkCount()
-{
-    return s_workCount;
-}
-
-void GcNoGcRegion_CountWork()
-{
-    s_workCount++;
-}
-
-void GcNoGcRegion_OnAllocate(CLR_UINT32 length)
-{
-    s_usedBlocks += length;
-}
-
 void GcNoGcRegion_OnCollect()
 {
     if (!g_GcNoGcRegion_Active)
@@ -153,7 +143,7 @@ void GcNoGcRegion_OnCollect()
     {
         CLR_Debug::Printf(
             "[GCN] broken by a collection: used_bytes=%llu\r\n",
-            (unsigned long long)(s_usedBlocks * sizeof(CLR_RT_HeapBlock)));
+            (unsigned long long)(UsedBlocks() * sizeof(CLR_RT_HeapBlock)));
     }
 
     g_GcNoGcRegion_Active = false;

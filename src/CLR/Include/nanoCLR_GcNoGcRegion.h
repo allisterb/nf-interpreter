@@ -30,11 +30,6 @@ HRESULT GcNoGcRegion_Start(CLR_INT64 bytes, bool &started);
 bool GcNoGcRegion_End();
 // The region is active, or was broken by a collection and not yet ended.
 bool GcNoGcRegion_InRegion();
-// GC work units run so far: full collections, compactions and incremental cycle steps (diagnostics).
-uint64_t GcNoGcRegion_WorkCount();
-void GcNoGcRegion_CountWork();
-// An allocation of length blocks inside the region: counted against the budget.
-void GcNoGcRegion_OnAllocate(CLR_UINT32 length);
 // A full collection was requested inside the region: it ends the region, which is reported as broken.
 void GcNoGcRegion_OnCollect();
 
@@ -47,25 +42,13 @@ void GcNoGcRegion_OnCollect();
             (flags) |= CLR_RT_HeapBlock::HB_NoGcOnFailure;                                                             \
         }                                                                                                              \
     }
-// In CLR_RT_HeapCluster::ExtractBlocks, once blocks are taken: count them against the budget (event-cache hits and
-// failed attempts are not counted).
-#define NANOCLR_GC_NOGC_ON_EXTRACTED(length)                                                                           \
-    {                                                                                                                  \
-        if (g_GcNoGcRegion_Active)                                                                                     \
-        {                                                                                                              \
-            GcNoGcRegion_OnAllocate(length);                                                                           \
-        }                                                                                                              \
-    }
 #define NANOCLR_GC_NOGC_ON_COLLECT() GcNoGcRegion_OnCollect();
-#define NANOCLR_GC_COUNT_WORK()      GcNoGcRegion_CountWork();
 
 #else
 
 #define NANOCLR_GC_NOGC_ACTIVE() (false)
 #define NANOCLR_GC_NOGC_NO_COLLECT(flags)
-#define NANOCLR_GC_NOGC_ON_EXTRACTED(length)
 #define NANOCLR_GC_NOGC_ON_COLLECT()
-#define NANOCLR_GC_COUNT_WORK()
 
 #endif // NANOCLR_GC_NOGC_REGION
 

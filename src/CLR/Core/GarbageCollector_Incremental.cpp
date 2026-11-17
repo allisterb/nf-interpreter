@@ -783,7 +783,7 @@ CLR_UINT32 TotalBytes();
 void StartCycle()
 {
     _ASSERTE(!s_sweeping);
-    NANOCLR_GC_COUNT_WORK()
+    NANOCLR_GC_STATS_SCOPE(IncrementalStep)
 
     const size_t stale = s_stress ? FirstCycleBit() : c_noBit;
 
@@ -853,6 +853,7 @@ void EndCycle()
 
 void AbortCycle(const char *reason)
 {
+    NANOCLR_GC_STATS_ON_CYCLE_ABORTED()
     CLR_Debug::Printf(
         "[GCC] cycle=%u aborted: %s after %u slices\r\n",
         (unsigned)s_cycleCount,
@@ -870,7 +871,7 @@ void AbortCycle(const char *reason)
 // One timed mark slice. Returns true when no grey work is left.
 bool RunSlice()
 {
-    NANOCLR_GC_COUNT_WORK()
+    NANOCLR_GC_STATS_SCOPE(IncrementalStep)
     uint64_t start = NowNs();
     bool done = Drain(s_sliceSlots);
     uint64_t elapsed = NowNs() - start;
@@ -890,8 +891,6 @@ bool RunSlice()
 // final pause at the next quantum boundary.
 void PaceStep()
 {
-    NANOCLR_GC_COUNT_WORK()
-
     // Grey work is left past the estimate W (the live set grew): double it, up to the heap in use, and catch up.
     auto reestimate = []() {
         if (s_cycle.scannedSlots >= s_paceWork && s_paceWork < s_paceUsed &&
@@ -912,6 +911,7 @@ void PaceStep()
 
     if (required > scanned)
     {
+        NANOCLR_GC_STATS_SCOPE(IncrementalStep)
         const size_t cap = s_paceStepSlots * 16;
         const size_t behind = (size_t)(required - scanned);
         const uint64_t start = NowNs();
@@ -1212,6 +1212,9 @@ GcProfile ParseProfile(const char *value)
 
     return GcProfile::Unknown;
 }
+
+// The preset in effect: set at startup and by GcIncremental_SetProfile; Batch, Interactive or LowLatency.
+GcProfile s_profile = GcProfile::Batch;
 
 // Calls f(obj, slot) for every object block in the heap walk.
 template <typename F> void ForEachObject(F f)
@@ -2053,7 +2056,7 @@ void RecordForced(const char *reason, CLR_UINT32 clusters, uint64_t ns)
 // Sweeps every cluster left, at once.
 void FinishSweep(const char *reason)
 {
-    NANOCLR_GC_COUNT_WORK()
+    NANOCLR_GC_STATS_SCOPE(IncrementalStep)
     const uint64_t start = NowNs();
     CLR_UINT32 clusters = 1;
 
@@ -2070,7 +2073,7 @@ void FinishSweep(const char *reason)
 // long as the last would still fit the budget.
 void SweepStep(uint64_t budgetNs)
 {
-    NANOCLR_GC_COUNT_WORK()
+    NANOCLR_GC_STATS_SCOPE(IncrementalStep)
     const uint64_t start = NowNs();
     uint64_t now = start;
     uint64_t last;
@@ -2191,8 +2194,11 @@ void GcIncremental_OnAllocate(const CLR_RT_HeapBlock *block, CLR_UINT32 flags)
     // still unzeroed, and before its colour is decided, so a cycle started here allocates it black too: nothing
     // references it yet, and the store that will (a root write, or a field of an old object, whose barrier shades only
     // the old value) cannot shade it.
+    // Stress and pacing work below delays this allocation: one pause.
+    NANOCLR_GC_STATS_PAUSE()
+
     // A no-GC region runs neither; s_allocatedSinceGc keeps counting, so a cycle starts soon after the region ends.
-    if (s_stressEvery != 0 && !NANOCLR_GC_NOGC_ACTIVE() && ++s_stressCount >= s_stressEvery)
+    if (s_stressEvery != 0 && s_incremental && !NANOCLR_GC_NOGC_ACTIVE() && ++s_stressCount >= s_stressEvery)
     {
         s_stressCount = 0;
         StressStep();
@@ -2361,6 +2367,7 @@ void GcIncremental_OnHeapInitialized()
     s_deferOnDeadline = false;
     s_deferredLast = false;
     s_idleWork = false;
+    s_profile = GcProfile::Batch;
 
     if (s_starts)
     {
@@ -2495,7 +2502,11 @@ void GcIncremental_OnHeapInitialized()
         CLR_Debug::Printf("[GCC] profile=%s: stop-the-world\r\n", c_profileNames[(int)profile]);
     }
 
-    if (s_incremental)
+    // The preset in effect, as GcPolicy.Profile reports it: without a profile, Batch or LowLatency's defaults.
+    s_profile = !s_incremental ? GcProfile::Batch
+                               : (profile == GcProfile::Interactive ? GcProfile::Interactive : GcProfile::LowLatency);
+
+    // Parsed whether or not the collector starts incremental, so GcPolicy.Profile can turn it on at run time.
     {
         const char *pace = getenv("NANOCLR_GC_INCREMENTAL_PACE");
         const char *paceStep = getenv("NANOCLR_GC_INCREMENTAL_PACE_STEP");
@@ -2545,7 +2556,10 @@ void GcIncremental_OnHeapInitialized()
         s_idleWork = idle == nullptr || strcmp(idle, "0") != 0;
         s_idleGuardNs = idleGuardUs && idleGuardUs[0] != '\0' ? strtoul(idleGuardUs, nullptr, 10) * (uint64_t)1000
                                                               : s_sweepCatchupNs + 100000;
+    }
 
+    if (s_incremental)
+    {
         CLR_Debug::Printf(
             "[GCC] incremental on: profile=%s trigger=%u slots slice=%u slots stress_every=%u allocations sweep=%s "
             "stats=%u fallback_every=%u clusters sweep_us=%u catchup_us=%u pace=%u%% pace_step=%u slots defer=%u "
@@ -2645,6 +2659,7 @@ bool GcIncremental_FinishCycle()
     s_cycle.markedEndNs = NowNs();
     s_cycle.liveNs = s_cycle.markedEndNs - liveStart;
     s_cycle.finalNs = s_cycle.markedEndNs - start;
+    NANOCLR_GC_STATS_ON_CYCLE_COMPLETED()
 
     return true;
 }
@@ -2749,6 +2764,8 @@ void GcIncremental_OnQuantum(bool deadline)
     const bool makeUp = s_deferredLast;
     s_deferredLast = false;
 
+    // Everything this boundary runs delays the next thread: one pause.
+    NANOCLR_GC_STATS_PAUSE()
     QuantumWork();
     if (makeUp)
     {
@@ -2761,7 +2778,7 @@ bool GcIncremental_OnIdle(CLR_INT64 timeout)
     // Short chunks, so ProcessTimer and the hardware events between them are not held off for long.
     constexpr uint64_t c_idleChunkNs = 1000000;
 
-    if (!s_idleWork || timeout <= 0)
+    if (!s_idleWork || !s_incremental || timeout <= 0)
     {
         return false;
     }
@@ -2790,7 +2807,11 @@ bool GcIncremental_OnIdle(CLR_INT64 timeout)
             cycleWork = true;
         }
 
-        QuantumWork();
+        {
+            NANOCLR_GC_STATS_PAUSE()
+            QuantumWork();
+        }
+
         const uint64_t end = NowNs();
 
         if ((s_cycleActive || s_sweeping) && s_cycle.startNs == cycleStart)
@@ -2821,8 +2842,66 @@ void GcIncremental_OnCompaction()
     }
 }
 
+HRESULT GcIncremental_SetProfile(CLR_INT32 profile)
+{
+    if (profile < 0 || profile > 2)
+    {
+        return CLR_E_OUT_OF_RANGE;
+    }
+
+    // GcPolicy's GcProfile counts from Batch; GcProfile here has Unset first.
+    const GcProfile p = (GcProfile)(profile + (int)GcProfile::Batch);
+
+    if (p != GcProfile::Batch && !s_valid)
+    {
+        return CLR_E_NOT_SUPPORTED;
+    }
+
+    NANOCLR_GC_STATS_PAUSE()
+
+    if (p == GcProfile::Batch)
+    {
+        if (s_cycleActive)
+        {
+            AbortCycle("profile batch");
+        }
+
+        if (s_sweeping)
+        {
+            FinishSweep("profile batch");
+        }
+
+        s_incremental = false;
+    }
+    else
+    {
+        // The preset's trigger, as at startup; the other settings keep their startup values.
+        const unsigned long percent = p == GcProfile::Interactive ? 15 : (s_pacePercent != 0 ? 1 : 25);
+        s_triggerSlots = s_slots * percent / 100;
+        s_incremental = true;
+    }
+
+    if (s_cycleStats && p != s_profile)
+    {
+        CLR_Debug::Printf(
+            "[GCC] profile=%s (set at run time) trigger=%u slots\r\n",
+            c_profileNames[(int)p],
+            (unsigned)s_triggerSlots);
+    }
+
+    s_profile = p;
+    return S_OK;
+}
+
+CLR_INT32 GcIncremental_Profile()
+{
+    return (CLR_INT32)s_profile - (CLR_INT32)GcProfile::Batch;
+}
+
 void GcIncremental_OnNoGcRegionStart()
 {
+    NANOCLR_GC_STATS_PAUSE()
+
     if (s_cycleActive)
     {
         AbortCycle("no-GC region");
@@ -2843,6 +2922,7 @@ CLR_RT_HeapBlock *GcIncremental_OnAllocationFailed(CLR_UINT32 dataType, CLR_UINT
         return nullptr;
     }
 
+    NANOCLR_GC_STATS_SCOPE(IncrementalStep)
     CLR_RT_HeapBlock *hb = nullptr;
 
     if (flags & CLR_RT_HeapBlock::HB_Event)

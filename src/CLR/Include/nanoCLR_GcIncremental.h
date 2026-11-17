@@ -120,6 +120,10 @@ bool GcIncremental_OnIdle(CLR_INT64 timeout);
 void GcIncremental_OnCompaction();
 // A no-GC region is starting: abort any active cycle, and finish any sweep, so no incremental work is left.
 void GcIncremental_OnNoGcRegionStart();
+// GcPolicy.Profile (0 Batch, 1 Interactive, 2 LowLatency). Setting Batch aborts any cycle, finishes any sweep and turns
+// incremental cycles off; the others turn them on with the preset's trigger. CLR_E_NOT_SUPPORTED without the bitmaps.
+HRESULT GcIncremental_SetProfile(CLR_INT32 profile);
+CLR_INT32 GcIncremental_Profile();
 
 #define NANOCLR_GC_PRE_WRITE(slot)                                                                                     \
     {                                                                                                                  \
@@ -166,6 +170,8 @@ void GcIncremental_OnNoGcRegionStart();
 #define NANOCLR_GC_ON_IDLE(timeout)        GcIncremental_OnIdle(timeout)
 #define NANOCLR_GC_ON_COMPACTION()         GcIncremental_OnCompaction();
 #define NANOCLR_GC_ON_NOGC_START()         GcIncremental_OnNoGcRegionStart();
+#define NANOCLR_GC_SET_PROFILE(profile)    GcIncremental_SetProfile(profile)
+#define NANOCLR_GC_PROFILE()               GcIncremental_Profile()
 #define NANOCLR_GC_MARK()                                                                                              \
     {                                                                                                                  \
         if (!GcIncremental_FinishCycle())                                                                              \
@@ -210,6 +216,10 @@ void GcIncremental_OnNoGcRegionStart();
 #define NANOCLR_GC_ON_IDLE(timeout)     ((void)(timeout), false)
 #define NANOCLR_GC_ON_COMPACTION()
 #define NANOCLR_GC_ON_NOGC_START()
+// Without the incremental build, only Batch.
+#define NANOCLR_GC_SET_PROFILE(profile)                                                                                \
+    ((CLR_UINT32)(profile) > 2 ? CLR_E_OUT_OF_RANGE : ((profile) == 0 ? S_OK : CLR_E_NOT_SUPPORTED))
+#define NANOCLR_GC_PROFILE()                     0
 #define NANOCLR_GC_MARK()                        Mark();
 #define NANOCLR_GC_COMPUTE_ALIVE_VS_DEAD_RATIO() Heap_ComputeAliveVsDeadRatio();
 #define NANOCLR_GC_ON_ALLOCATION_FAILED(hb, dataType, flags, length)
